@@ -1,0 +1,7 @@
+yt-dlp[default]
+groq
+gspread
+requests
+google-auth
+google-auth-oauthlib
+google-api-python-client
