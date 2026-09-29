@@ -398,7 +398,25 @@ def fb_upload_full_video(path, title, desc):
     ).json()
     if fin.get("success") is False:
         raise RuntimeError(f"FB finish failed: {fin}")
-    return video_id
+
+    # FB ab single video uploads ko bhi "Reel" ki tarah treat karta hai, isliye
+    # asli dekhne wala link nikalne ke liye permalink_url fetch karo (thoda wait
+    # karo taaki processing shuru ho jaye).
+    permalink = f"https://www.facebook.com/{video_id}"
+    for _ in range(6):
+        time.sleep(5)
+        try:
+            info = requests.get(
+                f"https://graph.facebook.com/{GRAPH_VER}/{video_id}",
+                params={"fields": "permalink_url,published", "access_token": FB_PAGE_TOKEN},
+                timeout=30,
+            ).json()
+            if info.get("permalink_url"):
+                permalink = f"https://www.facebook.com{info['permalink_url']}"
+                break
+        except Exception:
+            pass
+    return video_id, permalink
 
 
 # ---------------- 7. ORCHESTRATION ----------------
@@ -429,8 +447,10 @@ def process(url, reels_q):
 
     fb_note = ""
     try:
-        fb_id = fb_upload_full_video(master, title, meta.get("description", desc) if meta else desc)
-        fb_note = f"\n📘 FB video ID: {fb_id}" if fb_id else ""
+        fb_result = fb_upload_full_video(master, title, meta.get("description", desc) if meta else desc)
+        if fb_result:
+            fb_id, fb_link = fb_result
+            fb_note = f"\n📘 FB (dekhega Reel tab me): {fb_link}"
     except Exception as e:
         log(f"FB full-video upload failed (non-fatal): {e}")
         fb_note = f"\n⚠️ FB full-video upload fail hua: {str(e)[:200]}"
