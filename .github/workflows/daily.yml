@@ -37,6 +37,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run pipeline
+        id: run_pipeline
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -48,3 +49,12 @@ jobs:
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
         run: python pipeline.py
+
+      - name: Upload master video as artifact (for reels.py)
+        if: success() && steps.run_pipeline.outputs.yt_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: master-${{ steps.run_pipeline.outputs.yt_id }}
+          path: artifact_out/${{ steps.run_pipeline.outputs.yt_id }}.mp4
+          retention-days: 3
+          compression-level: 0
