@@ -4,16 +4,25 @@ Trending Shots — Reels distributor (IG Reels + FB Reels)
 Kya karta hai (har run):
   1. Google Sheet ki "ReelsQueue" tab se sabse purane pending master video ki
      row uthata hai.
-  2. YouTube se us video ka DIRECT stream URL nikalta hai (yt-dlp -g) — poora
-     video dobara download nahi hota, seedha us part ka seek+cut hota hai.
-  3. Part ko vertical 1080x1920 canvas me letterbox karta hai (upar-niche
-     black bar — horizontal video ke liye), aur upar "Part N/Total" likhta hai.
+  2. Master video ka source nikalta hai:
+       Priority 1: pipeline.py ne jo already-edited master video GitHub
+                   Actions "artifact" ke roop me save kiya tha, seedha wahi
+                   use karta hai — YouTube se DOBARA download nahi hota,
+                   koi cookies/bot-block ka jhanjhat nahi.
+       Priority 2 (fallback, sirf tab jab artifact expire/missing ho): sheet
+                   me stored ORIGINAL input link (jo Queue me paste kiya tha,
+                   FB wala) se yt-dlp se nikalta hai — YouTube link se NAHI.
+  3. Us part ko seek+cut karke vertical 1080x1920 canvas me letterbox karta
+     hai (upar-niche black bar — horizontal video ke liye), aur upar
+     "Part N/Total" likhta hai.
   4. IG Reels + FB Reels dono par upload karta hai — PUBLIC.
   5. IG ka rate limit LIVE check karta hai (content_publishing_limit API se);
      FB Reels ka rate limit apni History sheet se khud track karta hai
      (official docs: 30 reels/24h/page — hum 25 tak hi jaate hai, safety margin).
   6. Jitne parts is run me ho sakein utne karta hai (REELS_MAX_PER_RUN tak),
-     baaki agle scheduled run me.
+     baaki agle scheduled run me. Ek part dono platform par fail ho to usi
+     part ko dobara try karta hai (MAX_PART_RETRIES tak), index tabhi
+     badhta hai jab kam se kam ek platform par upload safal ho.
 """
 import os
 import re
@@ -21,6 +30,7 @@ import sys
 import json
 import time
 import shutil
+import zipfile
 import subprocess
 from datetime import datetime, timezone, timedelta
 
@@ -39,7 +49,8 @@ FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "")
 FB_PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
 GRAPH_VER = "v21.0"
 
-REELS_MAX_PER_RUN = int(os.environ.get("REELS_MAX_PER_RUN", "6"))
+REELS_MAX_PER_RUN = int(os.environ.get("REELS_MAX_PER_RUN", "4"))
+MAX_PART_RETRIES = 3             # itni baar fail hone ke baad hi part skip hoga
 FB_REELS_DAILY_CAP = 25          # docs allow 30/24h — safety margin niche rakha
 IG_SAFETY_MARGIN = 2             # IG ke live-reported total me se itna margin rakho
 
@@ -71,8 +82,11 @@ def tg(msg):
 
 
 def wipe_work():
+    keep = {os.path.abspath(p) for p in _master_cache.values() if p}
     for f in os.listdir(WORK):
         p = os.path.join(WORK, f)
+        if os.path.abspath(p) in keep:
+            continue
         try:
             os.remove(p) if os.path.isfile(p) else shutil.rmtree(p)
         except OSError:
@@ -93,7 +107,8 @@ def open_sheet():
 
 
 COLS = ["added", "yt_id", "yt_link", "title", "reel_caption", "hashtags_json",
-        "duration", "part_sec", "total_parts", "next_index", "status", "hint"]
+        "duration", "part_sec", "total_parts", "next_index", "status", "hint",
+        "source_url"]
 
 
 def pending_rows(reels_q):
@@ -146,21 +161,88 @@ def ig_quota_remaining():
         return 0
 
 
+# ---------------- MASTER VIDEO SOURCE ----------------
+# Priority 1: pipeline.py ne jo master video GitHub Actions "artifact" ke roop
+# me save kiya tha, wahi use karo — koi dobara download nahi, koi cookies nahi.
+# Priority 2 (fallback, tabhi jab artifact expire/missing ho): sheet me stored
+# ORIGINAL input link (FB wala) se yt-dlp se nikalo — YouTube link se NAHI,
+# taaki YouTube ka bot-block wala jhanjhat hi na aaye.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
+_master_cache = {}  # yt_id -> local file path, isi run ke andar dobara fetch na ho
+
+
+def fetch_master_artifact(yt_id):
+    if yt_id in _master_cache:
+        return _master_cache[yt_id]
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+        _master_cache[yt_id] = None
+        return None
+    name = f"master-{yt_id}"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/artifacts",
+            headers=headers, params={"name": name, "per_page": 10}, timeout=30,
+        )
+        r.raise_for_status()
+        arts = [a for a in r.json().get("artifacts", []) if not a.get("expired")]
+        if not arts:
+            log(f"Artifact '{name}' nahi mila (expire ho gaya ya abhi bana nahi) — fallback use hoga.")
+            _master_cache[yt_id] = None
+            return None
+        art = sorted(arts, key=lambda a: a["created_at"], reverse=True)[0]
+        dl = requests.get(art["archive_download_url"], headers=headers, timeout=600)
+        dl.raise_for_status()
+        zpath = os.path.join(WORK, f"{yt_id}_artifact.zip")
+        with open(zpath, "wb") as f:
+            f.write(dl.content)
+        with zipfile.ZipFile(zpath) as z:
+            mp4_names = [n for n in z.namelist() if n.endswith(".mp4")]
+            if not mp4_names:
+                _master_cache[yt_id] = None
+                return None
+            z.extract(mp4_names[0], WORK)
+            local_path = os.path.join(WORK, mp4_names[0])
+        log(f"Artifact '{name}' se master mil gaya (dobara download nahi hua).")
+        _master_cache[yt_id] = local_path
+        return local_path
+    except Exception as e:
+        log(f"Artifact fetch fail ({name}): {e}")
+        _master_cache[yt_id] = None
+        return None
+
+
+def get_master_source(d):
+    """Local file path (preferred) ya remote direct-URL (fallback) return karta hai."""
+    local = fetch_master_artifact(d["yt_id"])
+    if local:
+        return local
+    source_url = d.get("source_url") or d.get("yt_link")
+    log(f"Fallback: original source link se nikal raha hoon: {source_url}")
+    return get_direct_url(source_url)
+
+
 # ---------------- YT DIRECT URL ----------------
 def get_direct_url(yt_link):
     cmd = ["yt-dlp", "-f", "b[height<=720]/b", "-g"]
     if os.path.exists("cookies.txt"):
         cmd += ["--cookies", "cookies.txt"]
     cmd.append(yt_link)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    urls = [u for u in (r.stdout or "").strip().splitlines() if u.startswith("http")]
-    if r.returncode != 0 or not urls:
-        raise RuntimeError(f"yt-dlp direct URL fail: {(r.stderr or '')[-300:]}")
-    return urls[0]
+    last_err = ""
+    for attempt in range(3):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        urls = [u for u in (r.stdout or "").strip().splitlines() if u.startswith("http")]
+        if r.returncode == 0 and urls:
+            return urls[0]
+        last_err = (r.stderr or "")[-300:]
+        log(f"yt-dlp direct URL attempt {attempt + 1} fail, retrying in 20s: {last_err}")
+        time.sleep(20)
+    raise RuntimeError(f"yt-dlp direct URL fail after retries: {last_err}")
 
 
 # ---------------- CUT + VERTICAL LETTERBOX ----------------
-def cut_reel_part(direct_url, offset_sec, dur_sec, part_no, total_parts):
+def cut_reel_part(input_src, offset_sec, dur_sec, part_no, total_parts):
     out = os.path.join(WORK, f"part_{part_no}.mp4")
     label = f"Part {part_no}/{total_parts}".replace("'", "")
     vf = (
@@ -171,7 +253,7 @@ def cut_reel_part(direct_url, offset_sec, dur_sec, part_no, total_parts):
     )
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
-        "-ss", str(offset_sec), "-i", direct_url, "-t", str(dur_sec),
+        "-ss", str(offset_sec), "-i", input_src, "-t", str(dur_sec),
         "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", out,
@@ -206,7 +288,7 @@ def ig_upload_reel(video_path, caption):
     if up.get("success") is False:
         raise RuntimeError(f"IG binary upload failed: {up}")
 
-    for _ in range(30):
+    for _ in range(90):
         time.sleep(10)
         s = requests.get(
             f"https://graph.facebook.com/{GRAPH_VER}/{container_id}",
@@ -254,7 +336,7 @@ def fb_upload_reel(video_path, title, caption):
     if up.get("success") is False:
         raise RuntimeError(f"FB reel binary upload failed: {up}")
 
-    for _ in range(30):
+    for _ in range(90):
         time.sleep(10)
         s = requests.get(
             f"https://graph.facebook.com/{GRAPH_VER}/{video_id}",
@@ -334,15 +416,18 @@ def main():
             continue
 
         try:
-            direct_url = get_direct_url(d["yt_link"])
-            clip = cut_reel_part(direct_url, offset, this_dur, next_index, total_parts)
+            input_src = get_master_source(d)
+            clip = cut_reel_part(input_src, offset, this_dur, next_index, total_parts)
             caption = build_caption(d, next_index, total_parts)
+
+            ig_ok, fb_ok = False, False
 
             if ig_remaining > 0 and IG_USER_ID and IG_ACCESS_TOKEN:
                 try:
                     ig_id = ig_upload_reel(clip, caption)
                     hist.append_row([now_ist(), d["yt_link"], "SUCCESS", ig_id, d["title"], "", "IG_REEL"])
                     posted_ig += 1
+                    ig_ok = True
                 except Exception as e:
                     hist.append_row([now_ist(), d["yt_link"], "FAILED", "", d["title"], str(e)[:300], "IG_REEL"])
                     tg(f"❌ IG Reel FAILED (Part {next_index}/{total_parts}, {d['title']}):\n{str(e)[:300]}")
@@ -353,14 +438,31 @@ def main():
                     hist.append_row([now_ist(), d["yt_link"], "SUCCESS", fb_id, d["title"], "", "FB_REEL"])
                     posted_fb += 1
                     fb_used += 1
+                    fb_ok = True
                 except Exception as e:
                     hist.append_row([now_ist(), d["yt_link"], "FAILED", "", d["title"], str(e)[:300], "FB_REEL"])
                     tg(f"❌ FB Reel FAILED (Part {next_index}/{total_parts}, {d['title']}):\n{str(e)[:300]}")
 
-            new_index = next_index + 1
-            reels_q.update_cell(row_num, COLS.index("next_index") + 1, new_index)
-            if new_index > total_parts:
-                reels_q.update_cell(row_num, COLS.index("status") + 1, "done")
+            if ig_ok or fb_ok:
+                # Kam se kam ek platform pe gaya — agle part par badho, retry counter reset.
+                new_index = next_index + 1
+                reels_q.update_cell(row_num, COLS.index("next_index") + 1, new_index)
+                reels_q.update_cell(row_num, COLS.index("hint") + 1, "")
+                if new_index > total_parts:
+                    reels_q.update_cell(row_num, COLS.index("status") + 1, "done")
+            else:
+                # Dono platform is part par fail hue — index badhao mat, retry counter badhao.
+                retries = int((d.get("hint") or "0").strip() or 0) + 1
+                if retries >= MAX_PART_RETRIES:
+                    log(f"Part {next_index} {MAX_PART_RETRIES} baar fail hua — skip kar raha hoon.")
+                    tg(f"⚠️ Part {next_index}/{total_parts} ({d['title']}) {MAX_PART_RETRIES} baar fail hua, skip kiya.")
+                    reels_q.update_cell(row_num, COLS.index("next_index") + 1, next_index + 1)
+                    reels_q.update_cell(row_num, COLS.index("hint") + 1, "")
+                else:
+                    reels_q.update_cell(row_num, COLS.index("hint") + 1, str(retries))
+                failed += 1
+                if failed >= 2:
+                    break
 
         except Exception as e:
             failed += 1
