@@ -54,7 +54,9 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 WORK = "work"
+ARTIFACT_DIR = "artifact_out"   # ye WORK ke bahar hai, taaki wipe_work() isse na chhue
 os.makedirs(WORK, exist_ok=True)
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -100,7 +102,7 @@ def open_sheet():
         reels_q.append_row([
             "Added (IST)", "YT ID", "YT Link", "Title", "Reel Caption",
             "Hashtags JSON", "Duration Sec", "Part Sec", "Total Parts",
-            "Next Part Index", "Status", "Master URL Hint",
+            "Next Part Index", "Status", "Retry Hint", "Source URL",
         ])
     return queue, hist, reels_q
 
@@ -455,6 +457,12 @@ def process(url, reels_q):
         log(f"FB full-video upload failed (non-fatal): {e}")
         fb_note = f"\n⚠️ FB full-video upload fail hua: {str(e)[:200]}"
 
+    # Master ki ek copy ARTIFACT_DIR me rakho — GitHub Actions isse "artifact" ke
+    # roop me upload karega, taaki reels.py isko YouTube se DOBARA download kiye
+    # bina seedha use kar sake (na cookies chahiye na bot-block ka risk).
+    artifact_path = os.path.join(ARTIFACT_DIR, f"{vid}.mp4")
+    shutil.copy(master, artifact_path)
+
     # ReelsQueue me row daalo taaki reels.py isse baad me kaate
     reel_caption = (meta or {}).get("reel_caption") or title
     hashtags = clean_hashtags((meta or {}).get("hashtags"))
@@ -462,7 +470,7 @@ def process(url, reels_q):
     reels_q.append_row([
         now_ist(), vid, f"https://youtu.be/{vid}", title, reel_caption,
         json.dumps(hashtags, ensure_ascii=False), round(duration, 1), REEL_PART_SECONDS,
-        total_parts, 1, "pending", "",
+        total_parts, 1, "pending", "", url,
     ])
 
     thumb = (meta or {}).get("thumbnail_prompt", "")
@@ -491,6 +499,12 @@ def main():
             yt_link = f"https://youtu.be/{vid}"
             hist.append_row([now_ist(), url, "SUCCESS", yt_link, title, "", "YT+FB"])
             queue.delete_rows(row)
+
+            gh_out = os.environ.get("GITHUB_OUTPUT")
+            if gh_out:
+                with open(gh_out, "a") as f:
+                    f.write(f"yt_id={vid}\n")
+
             msg = (f"✅ SUCCESS\n{title}\n{yt_link}{fb_note}\n"
                    f"🎬 Reels queue me {total_parts} parts add hue (85 sec each)\n"
                    f"Queue me bache: {remaining}")
