@@ -45,13 +45,10 @@ SHEET_ID = os.environ.get("SHEET_ID", "")
 
 IG_USER_ID = os.environ.get("IG_USER_ID", "")
 IG_ACCESS_TOKEN = os.environ.get("IG_ACCESS_TOKEN", "")
-FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "")
-FB_PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
 GRAPH_VER = "v21.0"
 
 REELS_MAX_PER_RUN = int(os.environ.get("REELS_MAX_PER_RUN", "4"))
 MAX_PART_RETRIES = 3             # itni baar fail hone ke baad hi part skip hoga
-FB_REELS_DAILY_CAP = 25          # docs allow 30/24h — safety margin niche rakha
 IG_SAFETY_MARGIN = 2             # IG ke live-reported total me se itna margin rakho
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -121,25 +118,6 @@ def pending_rows(reels_q):
         if d.get("status", "").strip().lower() == "pending" and d.get("yt_id"):
             out.append((i, d))
     return out
-
-
-def fb_reels_used_last_24h(hist):
-    try:
-        values = hist.get_all_values()[-500:]  # perf: recent rows kaafi hai
-    except Exception:
-        return 0
-    cutoff = datetime.now(IST) - timedelta(hours=24)
-    count = 0
-    for row in values:
-        if len(row) < 7 or row[6] != "FB_REEL" or row[2] != "SUCCESS":
-            continue
-        try:
-            t = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-        except ValueError:
-            continue
-        if t >= cutoff:
-            count += 1
-    return count
 
 
 # ---------------- IG QUOTA ----------------
@@ -275,33 +253,48 @@ def ig_upload_reel(video_path, caption):
     if "id" not in r:
         raise RuntimeError(f"IG container create failed: {r}")
     container_id = r["id"]
+    # IMPORTANT: IG kabhi-kabhi container-creation response me hi ek "uri" deta
+    # hai jahan actual bytes bhejne hai. Agar hum ye ignore karke khud URL
+    # banate hai aur wo mismatch ho jaye, to video kabhi upload hi nahi hota
+    # aur container hamesha "IN_PROGRESS" me atka reh jata hai (yahi asli bug tha).
+    upload_url = r.get("uri") or f"https://rupload.facebook.com/ig-api-upload/{GRAPH_VER}/{container_id}"
+    log(f"IG container created: {container_id} | upload_url={upload_url}")
 
     size = os.path.getsize(video_path)
     with open(video_path, "rb") as f:
         data = f.read()
     up = requests.post(
-        f"https://rupload.facebook.com/ig-api-upload/{GRAPH_VER}/{container_id}",
+        upload_url,
         headers={"Authorization": f"OAuth {IG_ACCESS_TOKEN}",
-                 "offset": "0", "file_size": str(size)},
+                 "offset": "0", "file_size": str(size),
+                 "Content-Type": "application/octet-stream"},
         data=data, timeout=300,
-    ).json()
-    if up.get("success") is False:
-        raise RuntimeError(f"IG binary upload failed: {up}")
+    )
+    try:
+        up_json = up.json()
+    except Exception:
+        up_json = {"raw_text": up.text[:300], "status_code": up.status_code}
+    log(f"IG binary upload response ({up.status_code}): {up_json}")
+    if up.status_code >= 400 or up_json.get("success") is False:
+        raise RuntimeError(f"IG binary upload failed: {up_json}")
 
-    for _ in range(90):
+    last_status = {}
+    for i in range(60):
         time.sleep(10)
-        s = requests.get(
+        last_status = requests.get(
             f"https://graph.facebook.com/{GRAPH_VER}/{container_id}",
-            params={"fields": "status_code", "access_token": IG_ACCESS_TOKEN},
+            params={"fields": "status_code,status", "access_token": IG_ACCESS_TOKEN},
             timeout=30,
         ).json()
-        code = s.get("status_code")
+        code = last_status.get("status_code")
+        if i % 3 == 0:  # har 30 sec me ek baar log karo, spam nahi
+            log(f"IG container {container_id} poll {i}: {last_status}")
         if code == "FINISHED":
             break
         if code == "ERROR":
-            raise RuntimeError(f"IG container processing error: {s}")
+            raise RuntimeError(f"IG container processing error: {last_status}")
     else:
-        raise RuntimeError("IG container processing timeout")
+        raise RuntimeError(f"IG container processing timeout (last status: {last_status})")
 
     pub = requests.post(
         f"https://graph.facebook.com/{GRAPH_VER}/{IG_USER_ID}/media_publish",
@@ -311,55 +304,6 @@ def ig_upload_reel(video_path, caption):
     if "id" not in pub:
         raise RuntimeError(f"IG publish failed: {pub}")
     return pub["id"]
-
-
-# ---------------- FB REELS UPLOAD ----------------
-def fb_upload_reel(video_path, title, caption):
-    start = requests.post(
-        f"https://graph.facebook.com/{GRAPH_VER}/{FB_PAGE_ID}/video_reels",
-        data={"upload_phase": "start", "access_token": FB_PAGE_TOKEN},
-        timeout=60,
-    ).json()
-    if "video_id" not in start:
-        raise RuntimeError(f"FB reel start failed: {start}")
-    video_id = start["video_id"]
-    upload_url = start.get("upload_url") or f"https://rupload.facebook.com/video-upload/{GRAPH_VER}/{video_id}"
-
-    size = os.path.getsize(video_path)
-    with open(video_path, "rb") as f:
-        data = f.read()
-    up = requests.post(
-        upload_url,
-        headers={"Authorization": f"OAuth {FB_PAGE_TOKEN}", "offset": "0", "file_size": str(size)},
-        data=data, timeout=300,
-    ).json()
-    if up.get("success") is False:
-        raise RuntimeError(f"FB reel binary upload failed: {up}")
-
-    for _ in range(90):
-        time.sleep(10)
-        s = requests.get(
-            f"https://graph.facebook.com/{GRAPH_VER}/{video_id}",
-            params={"fields": "status", "access_token": FB_PAGE_TOKEN},
-            timeout=30,
-        ).json()
-        vstatus = (s.get("status") or {}).get("video_status")
-        if vstatus == "ready":
-            break
-        if vstatus in ("error", "upload_failed"):
-            raise RuntimeError(f"FB reel processing error: {s}")
-    else:
-        raise RuntimeError("FB reel processing timeout")
-
-    fin = requests.post(
-        f"https://graph.facebook.com/{GRAPH_VER}/{FB_PAGE_ID}/video_reels",
-        params={"access_token": FB_PAGE_TOKEN, "video_id": video_id, "upload_phase": "finish",
-                "video_state": "PUBLISHED", "description": caption, "title": title[:255]},
-        timeout=60,
-    ).json()
-    if fin.get("success") is False:
-        raise RuntimeError(f"FB reel publish failed: {fin}")
-    return video_id
 
 
 # ---------------- ORCHESTRATION ----------------
@@ -373,8 +317,8 @@ def main():
         with open("cookies.txt", "w") as f:
             f.write(os.environ["YT_COOKIES"])
 
-    if not (IG_USER_ID and IG_ACCESS_TOKEN) and not (FB_PAGE_ID and FB_PAGE_TOKEN):
-        log("Na IG na FB reels credentials mile — kuch karne layak nahi.")
+    if not (IG_USER_ID and IG_ACCESS_TOKEN):
+        log("IG credentials nahi mile — kuch karne layak nahi.")
         return 0
 
     try:
@@ -383,15 +327,12 @@ def main():
         tg(f"❌ ReelsQueue sheet open nahi hui: {e}")
         raise
 
-    posted_ig, posted_fb, failed = 0, 0, 0
-    fb_used = fb_reels_used_last_24h(hist)
+    posted_ig, failed = 0, 0
 
     for _ in range(REELS_MAX_PER_RUN):
-        ig_remaining = ig_quota_remaining() if (IG_USER_ID and IG_ACCESS_TOKEN) else 0
-        fb_remaining = max(0, FB_REELS_DAILY_CAP - fb_used) if (FB_PAGE_ID and FB_PAGE_TOKEN) else 0
-
-        if ig_remaining <= 0 and fb_remaining <= 0:
-            log("Dono platform ka daily quota khatam — run rok raha hoon.")
+        ig_remaining = ig_quota_remaining()
+        if ig_remaining <= 0:
+            log("IG ka daily quota khatam — run rok raha hoon.")
             break
 
         rows = pending_rows(reels_q)
@@ -420,38 +361,20 @@ def main():
             clip = cut_reel_part(input_src, offset, this_dur, next_index, total_parts)
             caption = build_caption(d, next_index, total_parts)
 
-            ig_ok, fb_ok = False, False
+            try:
+                ig_id = ig_upload_reel(clip, caption)
+                hist.append_row([now_ist(), d["yt_link"], "SUCCESS", ig_id, d["title"], "", "IG_REEL"])
+                posted_ig += 1
 
-            if ig_remaining > 0 and IG_USER_ID and IG_ACCESS_TOKEN:
-                try:
-                    ig_id = ig_upload_reel(clip, caption)
-                    hist.append_row([now_ist(), d["yt_link"], "SUCCESS", ig_id, d["title"], "", "IG_REEL"])
-                    posted_ig += 1
-                    ig_ok = True
-                except Exception as e:
-                    hist.append_row([now_ist(), d["yt_link"], "FAILED", "", d["title"], str(e)[:300], "IG_REEL"])
-                    tg(f"❌ IG Reel FAILED (Part {next_index}/{total_parts}, {d['title']}):\n{str(e)[:300]}")
-
-            if fb_remaining > 0 and FB_PAGE_ID and FB_PAGE_TOKEN:
-                try:
-                    fb_id = fb_upload_reel(clip, d["title"], caption)
-                    hist.append_row([now_ist(), d["yt_link"], "SUCCESS", fb_id, d["title"], "", "FB_REEL"])
-                    posted_fb += 1
-                    fb_used += 1
-                    fb_ok = True
-                except Exception as e:
-                    hist.append_row([now_ist(), d["yt_link"], "FAILED", "", d["title"], str(e)[:300], "FB_REEL"])
-                    tg(f"❌ FB Reel FAILED (Part {next_index}/{total_parts}, {d['title']}):\n{str(e)[:300]}")
-
-            if ig_ok or fb_ok:
-                # Kam se kam ek platform pe gaya — agle part par badho, retry counter reset.
                 new_index = next_index + 1
                 reels_q.update_cell(row_num, COLS.index("next_index") + 1, new_index)
                 reels_q.update_cell(row_num, COLS.index("hint") + 1, "")
                 if new_index > total_parts:
                     reels_q.update_cell(row_num, COLS.index("status") + 1, "done")
-            else:
-                # Dono platform is part par fail hue — index badhao mat, retry counter badhao.
+
+            except Exception as e:
+                hist.append_row([now_ist(), d["yt_link"], "FAILED", "", d["title"], str(e)[:300], "IG_REEL"])
+                tg(f"❌ IG Reel FAILED (Part {next_index}/{total_parts}, {d['title']}):\n{str(e)[:300]}")
                 retries = int((d.get("hint") or "0").strip() or 0) + 1
                 if retries >= MAX_PART_RETRIES:
                     log(f"Part {next_index} {MAX_PART_RETRIES} baar fail hua — skip kar raha hoon.")
@@ -468,14 +391,13 @@ def main():
             failed += 1
             log(f"Part {next_index} processing failed: {e}")
             tg(f"❌ Reel part processing FAILED ({d.get('title')}, part {next_index}):\n{str(e)[:300]}")
-            # yt-dlp/ffmpeg step fail hua (link/network issue) — index badhao mat, agli baar retry hoga
             if failed >= 2:
                 break
         finally:
             wipe_work()
 
-    if posted_ig or posted_fb:
-        tg(f"🎬 Reels run complete: IG={posted_ig}, FB={posted_fb} is baar upload hue.")
+    if posted_ig:
+        tg(f"🎬 Reels run complete: IG={posted_ig} is baar upload hue.")
     elif failed == 0:
         tg("🎬 Reels run: is baar kuch upload nahi hua (quota khatam ya queue khaali).")
     return 0
