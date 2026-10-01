@@ -278,8 +278,16 @@ def cut_reel_part(input_src, offset_sec, dur_sec, part_no, total_parts, title=""
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-ss", str(offset_sec), "-i", input_src, "-t", str(dur_sec),
-        "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+        "-vf", vf,
+        # IG Reels spec: fixed frame rate, closed GOP of 2-5s, H.264, 4:2:0.
+        # Generic "ProcessingFailedError" is commonly caused by videos that
+        # don't strictly match these (variable frame rate, open/long GOP,
+        # or audio not at 48kHz) even though the file "looks" fine otherwise.
+        "-r", "30", "-g", "60", "-sc_threshold", "0", "-bf", "2",
+        "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high",
+        "-crf", "23", "-maxrate", "6M", "-bufsize", "12M",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "128k",
         "-movflags", "+faststart", out,
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
