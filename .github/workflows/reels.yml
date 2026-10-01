@@ -1,5 +1,5 @@
 # Repo me is path par rakho:  .github/workflows/reels.yml
-name: Reels Distributor (IG + FB)
+name: Reels Distributor (IG only)
 
 on:
   schedule:
@@ -44,8 +44,6 @@ jobs:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REELS_MAX_PER_RUN: "4"
         run: python reels.py
