@@ -243,7 +243,7 @@ def cut_reel_part(input_src, offset_sec, dur_sec, part_no, total_parts):
 
 
 # ---------------- IG REELS UPLOAD ----------------
-def ig_upload_reel(video_path, caption):
+def _ig_upload_once(video_path, caption):
     r = requests.post(
         f"https://graph.facebook.com/{GRAPH_VER}/{IG_USER_ID}/media",
         data={"media_type": "REELS", "upload_type": "resumable",
@@ -276,6 +276,9 @@ def ig_upload_reel(video_path, caption):
         up_json = {"raw_text": up.text[:300], "status_code": up.status_code}
     log(f"IG binary upload response ({up.status_code}): {up_json}")
     if up.status_code >= 400 or up_json.get("success") is False:
+        # Meta ke server-side ka ek jaana-maana transient glitch: "ProcessingFailedError /
+        # Request processing failed" — same tarah ki file kabhi chal jati hai kabhi nahi.
+        # Isliye caller (ig_upload_reel) isko naye container ke saath retry karega.
         raise RuntimeError(f"IG binary upload failed: {up_json}")
 
     last_status = {}
@@ -304,6 +307,22 @@ def ig_upload_reel(video_path, caption):
     if "id" not in pub:
         raise RuntimeError(f"IG publish failed: {pub}")
     return pub["id"]
+
+
+def ig_upload_reel(video_path, caption, max_attempts=3):
+    """Meta ke server-side par kabhi-kabhi 'ProcessingFailedError' aata hai
+    (transient glitch, same file dobara try karne par chal jati hai). Isliye
+    naya container bana ke, thoda ruk ke, dobara try karo."""
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _ig_upload_once(video_path, caption)
+        except Exception as e:
+            last_err = e
+            log(f"IG upload attempt {attempt}/{max_attempts} failed: {e}")
+            if attempt < max_attempts:
+                time.sleep(15 * attempt)
+    raise last_err
 
 
 # ---------------- ORCHESTRATION ----------------
