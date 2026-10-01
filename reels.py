@@ -29,6 +29,7 @@ import re
 import sys
 import json
 import time
+import random
 import shutil
 import zipfile
 import subprocess
@@ -100,7 +101,25 @@ def open_sheet():
     except gspread.WorksheetNotFound:
         hist = sh.add_worksheet("History", 2000, 7)
         hist.append_row(["Time (IST)", "Link", "Status", "YouTube Link", "Title", "Error", "Platform"])
-    return reels_q, hist
+    try:
+        state = sh.worksheet("State")
+    except gspread.WorksheetNotFound:
+        state = sh.add_worksheet("State", 10, 2)
+        state.append_row(["key", "value"])
+    return reels_q, hist, state
+
+
+def get_state(state_ws):
+    rows = state_ws.get_all_values()[1:]
+    return {r[0]: r[1] for r in rows if r and r[0]}
+
+
+def set_state(state_ws, key, value):
+    cell = state_ws.find(key, in_column=1)
+    if cell:
+        state_ws.update_cell(cell.row, 2, value)
+    else:
+        state_ws.append_row([key, value])
 
 
 COLS = ["added", "yt_id", "yt_link", "title", "reel_caption", "hashtags_json",
@@ -118,6 +137,17 @@ def pending_rows(reels_q):
         if d.get("status", "").strip().lower() == "pending" and d.get("yt_id"):
             out.append((i, d))
     return out
+
+
+def find_row_by_yt_id(reels_q, yt_id):
+    """Row number + dict for a specific yt_id, chahe koi bhi status ho. None agar nahi mila."""
+    values = reels_q.get_all_values()
+    for i, row in enumerate(values[1:], start=2):
+        row = row + [""] * (len(COLS) - len(row))
+        d = dict(zip(COLS, row))
+        if d.get("yt_id") == yt_id:
+            return i, d
+    return None, None
 
 
 # ---------------- IG QUOTA ----------------
@@ -220,14 +250,30 @@ def get_direct_url(yt_link):
 
 
 # ---------------- CUT + VERTICAL LETTERBOX ----------------
-def cut_reel_part(input_src, offset_sec, dur_sec, part_no, total_parts):
+def _dt_escape(s):
+    """ffmpeg drawtext ke liye khatarnak characters hata do (colon/%/backslash/quote)."""
+    return re.sub(r"[:%\\']", "", str(s))
+
+
+def cut_reel_part(input_src, offset_sec, dur_sec, part_no, total_parts, title=""):
     out = os.path.join(WORK, f"part_{part_no}.mp4")
-    label = f"Part {part_no}/{total_parts}".replace("'", "")
+    label = _dt_escape(f"Part {part_no}/{total_parts}")
+    title_display = _dt_escape(title)[:42]
+    if len(title) > 42:
+        title_display += "..."
+
     vf = (
         "scale=w=1080:h=1920:force_original_aspect_ratio=decrease,"
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-        f"drawtext=fontfile={FONT}:text='{label}':x=(w-text_w)/2:y=60:"
-        "fontsize=56:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=14"
+        # Part number — ab top edge se thoda niche (pehle bohot upar chipka tha)
+        f"drawtext=fontfile={FONT}:text='{label}':x=(w-text_w)/2:y=300:"
+        "fontsize=52:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12,"
+        # Title — Part number ke thoda niche, chhote font me
+        f"drawtext=fontfile={FONT}:text='{title_display}':x=(w-text_w)/2:y=380:"
+        "fontsize=32:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=8,"
+        # Yellow watermark — video ke niche (bottom black bar me)
+        f"drawtext=fontfile={FONT}:text='@trending_shots_ai':x=(w-text_w)/2:y=h-100:"
+        "fontsize=38:fontcolor=yellow"
     )
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
@@ -240,6 +286,7 @@ def cut_reel_part(input_src, offset_sec, dur_sec, part_no, total_parts):
     if r.returncode != 0 or not os.path.exists(out):
         raise RuntimeError(f"ffmpeg cut failed: {(r.stderr or '')[-400:]}")
     return out
+
 
 
 # ---------------- IG REELS UPLOAD ----------------
@@ -341,24 +388,48 @@ def main():
         return 0
 
     try:
-        reels_q, hist = open_sheet()
+        reels_q, hist, state_ws = open_sheet()
     except Exception as e:
         tg(f"❌ ReelsQueue sheet open nahi hui: {e}")
         raise
 
+    # ---- Din me sirf EK series: aaj ka "active" video lock karo ----
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    state = get_state(state_ws)
+    active_yt_id = state.get("active_yt_id", "")
+
+    if state.get("active_date") != today:
+        # Naya din — agla (sabse purana pending) video is din ke liye lock karo.
+        rows = pending_rows(reels_q)
+        active_yt_id = rows[0][1]["yt_id"] if rows else ""
+        set_state(state_ws, "active_date", today)
+        set_state(state_ws, "active_yt_id", active_yt_id)
+        log(f"Naya din — aaj ka series lock kiya: {active_yt_id or '(koi pending video nahi)'}")
+
+    if not active_yt_id:
+        tg("📭 Koi pending video nahi hai ReelsQueue me.")
+        return 0
+
+    row_num, d = find_row_by_yt_id(reels_q, active_yt_id)
+    if not d:
+        log(f"Active series {active_yt_id} ReelsQueue me nahi mila (delete ho gaya?).")
+        return 0
+    if d.get("status", "").strip().lower() == "done":
+        tg(f"✅ Aaj ka series ({d.get('title')}) pehle hi poora ho chuka hai. Kal agla series shuru hoga.")
+        return 0
+
     posted_ig, failed = 0, 0
 
-    for _ in range(REELS_MAX_PER_RUN):
+    for i in range(REELS_MAX_PER_RUN):
         ig_remaining = ig_quota_remaining()
         if ig_remaining <= 0:
             log("IG ka daily quota khatam — run rok raha hoon.")
             break
 
-        rows = pending_rows(reels_q)
-        if not rows:
-            log("ReelsQueue khaali hai.")
+        row_num, d = find_row_by_yt_id(reels_q, active_yt_id)
+        if not d or d.get("status", "").strip().lower() == "done":
+            log("Aaj ka series poora ho gaya.")
             break
-        row_num, d = rows[0]
 
         duration = float(d.get("duration") or 0)
         part_sec = int(float(d.get("part_sec") or 85))
@@ -367,19 +438,21 @@ def main():
 
         if next_index > total_parts:
             reels_q.update_cell(row_num, COLS.index("status") + 1, "done")
-            continue
+            break
 
         offset = (next_index - 1) * part_sec
         this_dur = min(part_sec, duration - offset)
         if this_dur < 15:
             reels_q.update_cell(row_num, COLS.index("status") + 1, "done")
-            continue
+            break
 
+        did_upload_attempt = False
         try:
             input_src = get_master_source(d)
-            clip = cut_reel_part(input_src, offset, this_dur, next_index, total_parts)
+            clip = cut_reel_part(input_src, offset, this_dur, next_index, total_parts, d.get("title", ""))
             caption = build_caption(d, next_index, total_parts)
 
+            did_upload_attempt = True
             try:
                 ig_id = ig_upload_reel(clip, caption)
                 hist.append_row([now_ist(), d["yt_link"], "SUCCESS", ig_id, d["title"], "", "IG_REEL"])
@@ -415,10 +488,17 @@ def main():
         finally:
             wipe_work()
 
+        # Spam na lage isliye har upload attempt ke baad random gap (30-180 sec),
+        # agle part se pehle. Last iteration ke baad rukne ki zaroorat nahi.
+        if did_upload_attempt and i < REELS_MAX_PER_RUN - 1:
+            gap = random.randint(30, 180)
+            log(f"Agle part se pehle {gap}s ruk raha hoon (anti-spam pacing)...")
+            time.sleep(gap)
+
     if posted_ig:
         tg(f"🎬 Reels run complete: IG={posted_ig} is baar upload hue.")
     elif failed == 0:
-        tg("🎬 Reels run: is baar kuch upload nahi hua (quota khatam ya queue khaali).")
+        tg("🎬 Reels run: is baar kuch upload nahi hua (quota khatam ya series poora ho chuka).")
     return 0
 
 
