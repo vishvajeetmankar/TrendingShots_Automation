@@ -20,9 +20,10 @@ Kya karta hai (har run):
      FB Reels ka rate limit apni History sheet se khud track karta hai
      (official docs: 30 reels/24h/page — hum 25 tak hi jaate hai, safety margin).
   6. Jitne parts is run me ho sakein utne karta hai (REELS_MAX_PER_RUN tak),
-     baaki agle scheduled run me. Ek part dono platform par fail ho to usi
-     part ko dobara try karta hai (MAX_PART_RETRIES tak), index tabhi
-     badhta hai jab kam se kam ek platform par upload safal ho.
+     baaki agle scheduled run me. Ek part fail ho to KABHI skip nahi hota —
+     agla run usi part ko phir try karega, jab tak upload safal na ho jaye
+     (Meta ka "ProcessingFailedError" genuinely random/transient hai, isliye
+     fixed retry-limit lagane se series me gaps aa jate the).
 """
 import os
 import re
@@ -49,7 +50,6 @@ IG_ACCESS_TOKEN = os.environ.get("IG_ACCESS_TOKEN", "")
 GRAPH_VER = "v21.0"
 
 REELS_MAX_PER_RUN = int(os.environ.get("REELS_MAX_PER_RUN", "4"))
-MAX_PART_RETRIES = 3             # itni baar fail hone ke baad hi part skip hoga
 IG_SAFETY_MARGIN = 2             # IG ke live-reported total me se itna margin rakho
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -364,10 +364,10 @@ def _ig_upload_once(video_path, caption):
     return pub["id"]
 
 
-def ig_upload_reel(video_path, caption, max_attempts=3):
+def ig_upload_reel(video_path, caption, max_attempts=4):
     """Meta ke server-side par kabhi-kabhi 'ProcessingFailedError' aata hai
-    (transient glitch, same file dobara try karne par chal jati hai). Isliye
-    naya container bana ke, thoda ruk ke, dobara try karo."""
+    (transient glitch — same file kabhi reject hoti hai kabhi accept). Isliye
+    naya container bana ke, thoda zyada ruk ke, dobara try karo."""
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -376,7 +376,7 @@ def ig_upload_reel(video_path, caption, max_attempts=3):
             last_err = e
             log(f"IG upload attempt {attempt}/{max_attempts} failed: {e}")
             if attempt < max_attempts:
-                time.sleep(15 * attempt)
+                time.sleep(30 * attempt)
     raise last_err
 
 
@@ -474,15 +474,14 @@ def main():
 
             except Exception as e:
                 hist.append_row([now_ist(), d["yt_link"], "FAILED", "", d["title"], str(e)[:300], "IG_REEL"])
-                tg(f"❌ IG Reel FAILED (Part {next_index}/{total_parts}, {d['title']}):\n{str(e)[:300]}")
                 retries = int((d.get("hint") or "0").strip() or 0) + 1
-                if retries >= MAX_PART_RETRIES:
-                    log(f"Part {next_index} {MAX_PART_RETRIES} baar fail hua — skip kar raha hoon.")
-                    tg(f"⚠️ Part {next_index}/{total_parts} ({d['title']}) {MAX_PART_RETRIES} baar fail hua, skip kiya.")
-                    reels_q.update_cell(row_num, COLS.index("next_index") + 1, next_index + 1)
-                    reels_q.update_cell(row_num, COLS.index("hint") + 1, "")
-                else:
-                    reels_q.update_cell(row_num, COLS.index("hint") + 1, str(retries))
+                reels_q.update_cell(row_num, COLS.index("hint") + 1, str(retries))
+                # IMPORTANT: index KABHI nahi badhta jab tak upload safal na ho —
+                # taaki series me koi part permanently gayab na ho. Agar yehi
+                # part baar-baar fail ho raha hai (Meta ka apna transient
+                # "ProcessingFailedError"), agla scheduled run phir try karega.
+                tg(f"❌ IG Reel FAILED (Part {next_index}/{total_parts}, {d['title']}, "
+                   f"ab tak {retries} baar fail) — agla run phir try karega:\n{str(e)[:300]}")
                 failed += 1
                 if failed >= 2:
                     break
