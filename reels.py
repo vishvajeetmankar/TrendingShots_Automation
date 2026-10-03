@@ -46,7 +46,11 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
 
 REELS_MAX_PER_RUN = int(os.environ.get("REELS_MAX_PER_RUN", "4"))
-MAX_RUN_LEVEL_RETRIES = 8
+# Pehle 8 tha — lekin ek atka hua part tab tak USI run me baar-baar retry hota
+# hai (aage ke parts try hi nahi hote jab tak ye resolve na ho), isliye 8 tak
+# pahunchne me ~8 ghante lag rahe the. Ab 4 par skip hoga (~4 ghante), taaki
+# series zyada der block na rahe.
+MAX_RUN_LEVEL_RETRIES = 4
 IG_SAFETY_MARGIN = 2
 
 WORK = "reels_work"
