@@ -226,6 +226,41 @@ def fetch_parts_artifact(yt_id):
 
 
 # ---------------- IG REELS UPLOAD ----------------
+IG_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB — poori file ek saath bhejne ki jagah
+                                  # chunks me bhejo (Meta ke docs khud "resume
+                                  # from offset" bolte hai interrupted upload
+                                  # ke liye — ek hi giant request flaky network
+                                  # par fail hone ka zyada chance deta hai)
+
+
+def _ig_upload_bytes(upload_url, video_path):
+    """Chunk-by-chunk upload: har chunk apna 'offset' (is chunk ka starting
+    byte) aur poori file ka 'file_size' bhejta hai, jaisa Meta ke docs me
+    resumable upload ke liye diya gaya hai."""
+    size = os.path.getsize(video_path)
+    offset = 0
+    with open(video_path, "rb") as f:
+        while offset < size:
+            f.seek(offset)
+            chunk = f.read(IG_CHUNK_SIZE)
+            up = requests.post(
+                upload_url,
+                headers={"Authorization": f"OAuth {IG_ACCESS_TOKEN}",
+                         "offset": str(offset), "file_size": str(size),
+                         "Content-Type": "application/octet-stream"},
+                data=chunk, timeout=120,
+            )
+            try:
+                up_json = up.json()
+            except Exception:
+                up_json = {"raw_text": up.text[:300], "status_code": up.status_code}
+            log(f"IG chunk upload offset={offset}/{size} len={len(chunk)} "
+                f"-> ({up.status_code}): {up_json}")
+            if up.status_code >= 400 or up_json.get("success") is False:
+                raise RuntimeError(f"IG chunk upload failed at offset {offset}: {up_json}")
+            offset += len(chunk)
+
+
 def _ig_upload_once(video_path, caption):
     r = requests.post(
         f"https://graph.facebook.com/{GRAPH_VER}/{IG_USER_ID}/media",
@@ -239,23 +274,7 @@ def _ig_upload_once(video_path, caption):
     upload_url = r.get("uri") or f"https://rupload.facebook.com/ig-api-upload/{GRAPH_VER}/{container_id}"
     log(f"IG container created: {container_id} | upload_url={upload_url}")
 
-    size = os.path.getsize(video_path)
-    with open(video_path, "rb") as f:
-        data = f.read()
-    up = requests.post(
-        upload_url,
-        headers={"Authorization": f"OAuth {IG_ACCESS_TOKEN}",
-                 "offset": "0", "file_size": str(size),
-                 "Content-Type": "application/octet-stream"},
-        data=data, timeout=300,
-    )
-    try:
-        up_json = up.json()
-    except Exception:
-        up_json = {"raw_text": up.text[:300], "status_code": up.status_code}
-    log(f"IG binary upload response ({up.status_code}): {up_json}")
-    if up.status_code >= 400 or up_json.get("success") is False:
-        raise RuntimeError(f"IG binary upload failed: {up_json}")
+    _ig_upload_bytes(upload_url, video_path)
 
     last_status = {}
     for i in range(60):
