@@ -7,9 +7,13 @@ Har run:
   3. Pehle 10 min transcribe (Groq Whisper) + Groq LLM se SEO metadata.
   4. Master video YouTube par upload (unlisted/public — see PRIVACY).
   5. WAHI master video Facebook Page par bhi upload (normal video post).
-  6. "ReelsQueue" tab me ek row daalta hai — taaki reels.py isko baad me
-     85-sec ke parts me kaatke IG Reels + FB Reels par daal sake.
-  7. Success/fail Queue se link delete, History me log, Telegram notify.
+  6. USI RUN ME turant saare 85-sec Reel parts bhi kaat deta hai — vertical
+     1080x1920 + Part number + title + watermark, IG-ready state me — aur
+     unhe ek GitHub "artifact" (parts-<video_id>) me save kar deta hai.
+     reels.py ab sirf ye ready files uthake upload karta hai, kuch cut/
+     convert nahi karta (na YouTube chhuta hai na koi cookies chahiye).
+  7. "ReelsQueue" tab me ek row daalta hai taaki reels.py progress track kare.
+  8. Success/fail Queue se link delete, History me log, Telegram notify.
 """
 import os
 import re
@@ -30,6 +34,7 @@ from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
 from seo_utils import clean_hashtags, clean_tags, hashtag_block
+from video_utils import make_reel_part
 
 # ---------------- CONFIG ----------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -457,16 +462,32 @@ def process(url, reels_q):
         log(f"FB full-video upload failed (non-fatal): {e}")
         fb_note = f"\n⚠️ FB full-video upload fail hua: {str(e)[:200]}"
 
-    # Master ki ek copy ARTIFACT_DIR me rakho — GitHub Actions isse "artifact" ke
-    # roop me upload karega, taaki reels.py isko YouTube se DOBARA download kiye
-    # bina seedha use kar sake (na cookies chahiye na bot-block ka risk).
-    artifact_path = os.path.join(ARTIFACT_DIR, f"{vid}.mp4")
-    shutil.copy(master, artifact_path)
+    # ---- Saare Reel parts ABHI hi taiyar kar do (vertical + watermark + part
+    # number) — reels.py baad me sirf inhe upload karega, kuch cut/convert
+    # nahi karega. YT/FB upload (network wait) ke baad CPU khaali hi hota hai,
+    # isliye ye yahan turant karna sabse efficient hai.
+    total_parts = max(1, int(duration // REEL_PART_SECONDS) + (1 if duration % REEL_PART_SECONDS >= 15 else 0))
+    parts_dir = os.path.join(ARTIFACT_DIR, "parts")
+    os.makedirs(parts_dir, exist_ok=True)
+    status(f"Reel parts taiyar ho rahe hai (total {total_parts}, ~{REEL_PART_SECONDS}s each)")
+    parts_made = 0
+    for i in range(1, total_parts + 1):
+        offset = (i - 1) * REEL_PART_SECONDS
+        this_dur = min(REEL_PART_SECONDS, duration - offset)
+        if this_dur < 15:
+            total_parts = i - 1  # ye aakhri chhota tukda chhod do
+            break
+        out_path = os.path.join(parts_dir, f"part_{i:03d}.mp4")
+        try:
+            make_reel_part(master, offset, this_dur, i, total_parts, title, out_path)
+            parts_made += 1
+        except Exception as e:
+            log(f"Part {i} banane me fail hua (skip): {e}")
+    log(f"{parts_made}/{total_parts} reel parts taiyar ho gaye.")
 
-    # ReelsQueue me row daalo taaki reels.py isse baad me kaate
+    # ReelsQueue me row daalo taaki reels.py isse baad me upload kare
     reel_caption = (meta or {}).get("reel_caption") or title
     hashtags = clean_hashtags((meta or {}).get("hashtags"))
-    total_parts = max(1, int(duration // REEL_PART_SECONDS) + (1 if duration % REEL_PART_SECONDS >= 15 else 0))
     reels_q.append_row([
         now_ist(), vid, f"https://youtu.be/{vid}", title, reel_caption,
         json.dumps(hashtags, ensure_ascii=False), round(duration, 1), REEL_PART_SECONDS,
