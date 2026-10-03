@@ -466,33 +466,43 @@ def process(url, reels_q):
     # number) — reels.py baad me sirf inhe upload karega, kuch cut/convert
     # nahi karega. YT/FB upload (network wait) ke baad CPU khaali hi hota hai,
     # isliye ye yahan turant karna sabse efficient hai.
-    total_parts = max(1, int(duration // REEL_PART_SECONDS) + (1 if duration % REEL_PART_SECONDS >= 15 else 0))
-    parts_dir = os.path.join(ARTIFACT_DIR, "parts")
-    os.makedirs(parts_dir, exist_ok=True)
-    status(f"Reel parts taiyar ho rahe hai (total {total_parts}, ~{REEL_PART_SECONDS}s each)")
-    parts_made = 0
-    for i in range(1, total_parts + 1):
-        offset = (i - 1) * REEL_PART_SECONDS
-        this_dur = min(REEL_PART_SECONDS, duration - offset)
-        if this_dur < 15:
-            total_parts = i - 1  # ye aakhri chhota tukda chhod do
-            break
-        out_path = os.path.join(parts_dir, f"part_{i:03d}.mp4")
-        try:
-            make_reel_part(master, offset, this_dur, i, total_parts, title, out_path)
-            parts_made += 1
-        except Exception as e:
-            log(f"Part {i} banane me fail hua (skip): {e}")
-    log(f"{parts_made}/{total_parts} reel parts taiyar ho gaye.")
+    # IMPORTANT: ye POORA block try/except me hai — YT aur FB upload isse PEHLE
+    # hi successfully ho chuke hote hai, isliye reels-prep me koi bhi bug aaye
+    # to bhi wo YT/FB ki success ko kabhi "FAILED" nahi banayega (jaisa pehle
+    # ek baar galti se hua tha — turant fix kar diya gaya).
+    total_parts = 0
+    try:
+        total_parts = max(1, int(duration // REEL_PART_SECONDS) + (1 if duration % REEL_PART_SECONDS >= 15 else 0))
+        parts_dir = os.path.join(ARTIFACT_DIR, "parts")
+        os.makedirs(parts_dir, exist_ok=True)
+        log(f"Reel parts taiyar ho rahe hai (total {total_parts}, ~{REEL_PART_SECONDS}s each)")
+        parts_made = 0
+        for i in range(1, total_parts + 1):
+            offset = (i - 1) * REEL_PART_SECONDS
+            this_dur = min(REEL_PART_SECONDS, duration - offset)
+            if this_dur < 15:
+                total_parts = i - 1  # ye aakhri chhota tukda chhod do
+                break
+            out_path = os.path.join(parts_dir, f"part_{i:03d}.mp4")
+            try:
+                make_reel_part(master, offset, this_dur, i, total_parts, title, out_path)
+                parts_made += 1
+            except Exception as e:
+                log(f"Part {i} banane me fail hua (skip): {e}")
+        log(f"{parts_made}/{total_parts} reel parts taiyar ho gaye.")
 
-    # ReelsQueue me row daalo taaki reels.py isse baad me upload kare
-    reel_caption = (meta or {}).get("reel_caption") or title
-    hashtags = clean_hashtags((meta or {}).get("hashtags"))
-    reels_q.append_row([
-        now_ist(), vid, f"https://youtu.be/{vid}", title, reel_caption,
-        json.dumps(hashtags, ensure_ascii=False), round(duration, 1), REEL_PART_SECONDS,
-        total_parts, 1, "pending", "", url,
-    ])
+        # ReelsQueue me row daalo taaki reels.py isse baad me upload kare
+        reel_caption = (meta or {}).get("reel_caption") or title
+        hashtags = clean_hashtags((meta or {}).get("hashtags"))
+        reels_q.append_row([
+            now_ist(), vid, f"https://youtu.be/{vid}", title, reel_caption,
+            json.dumps(hashtags, ensure_ascii=False), round(duration, 1), REEL_PART_SECONDS,
+            total_parts, 1, "pending", "", url,
+        ])
+    except Exception as e:
+        log(f"Reel parts prep me fail hua (non-fatal, YT/FB already ho chuka hai): {e}")
+        fb_note += f"\n⚠️ Reel parts taiyar nahi ho paye: {str(e)[:150]}"
+        total_parts = 0
 
     thumb = (meta or {}).get("thumbnail_prompt", "")
     return vid, title, thumb, fb_note, total_parts
