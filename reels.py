@@ -1,39 +1,32 @@
 """
-Trending Shots — Reels distributor (IG Reels + FB Reels)
+Trending Shots — Reels distributor (IG Reels only)
 
 Kya karta hai (har run):
-  1. Google Sheet ki "ReelsQueue" tab se sabse purane pending master video ki
-     row uthata hai.
-  2. Master video ka source nikalta hai:
-       Priority 1: pipeline.py ne jo already-edited master video GitHub
-                   Actions "artifact" ke roop me save kiya tha, seedha wahi
-                   use karta hai — YouTube se DOBARA download nahi hota,
-                   koi cookies/bot-block ka jhanjhat nahi.
-       Priority 2 (fallback, sirf tab jab artifact expire/missing ho): sheet
-                   me stored ORIGINAL input link (jo Queue me paste kiya tha,
-                   FB wala) se yt-dlp se nikalta hai — YouTube link se NAHI.
-  3. Us part ko seek+cut karke vertical 1080x1920 canvas me letterbox karta
-     hai (upar-niche black bar — horizontal video ke liye), aur upar
-     "Part N/Total" likhta hai.
-  4. IG Reels + FB Reels dono par upload karta hai — PUBLIC.
-  5. IG ka rate limit LIVE check karta hai (content_publishing_limit API se);
-     FB Reels ka rate limit apni History sheet se khud track karta hai
-     (official docs: 30 reels/24h/page — hum 25 tak hi jaate hai, safety margin).
-  6. Jitne parts is run me ho sakein utne karta hai (REELS_MAX_PER_RUN tak),
-     baaki agle scheduled run me. Ek part fail ho to KABHI skip nahi hota —
-     agla run usi part ko phir try karega, jab tak upload safal na ho jaye
-     (Meta ka "ProcessingFailedError" genuinely random/transient hai, isliye
-     fixed retry-limit lagane se series me gaps aa jate the).
+  1. Google Sheet ke "State" tab se pata karta hai kaunsa series "active" hai
+     (ek time pe sirf ek series ke parts jaate hai, mix nahi hote). Agar
+     active series khatam/missing hai, turant agla pending series uthata hai.
+  2. pipeline.py ne us series ke SAARE 85-sec parts already taiyar karke
+     (vertical + watermark + part number, IG-ready) ek GitHub "artifact"
+     (parts-<video_id>) me save kiye hote hai — ye sirf wahi download karke
+     agla part uthata hai. KOI cutting/converting yahan nahi hoti, isliye na
+     YouTube chhuna padta hai na cookies chahiye.
+  3. Us part ko Instagram Reels par PUBLIC upload karta hai.
+  4. IG ka rate limit LIVE check karta hai (content_publishing_limit API se).
+  5. Jitne parts is run me ho sakein utne karta hai (REELS_MAX_PER_RUN tak,
+     beech me random 30-180s anti-spam gap), baaki agle scheduled run me.
+  6. Ek part fail ho to turant skip NAHI hota — agla run usi part ko phir try
+     karega. Sirf bahut zyada baar (MAX_RUN_LEVEL_RETRIES) fail hone par hi
+     skip hota hai, taaki ek genuinely-kharab part pura series block na kare.
+     Sheet ke "Retry Hint" column me manually "skip" likh ke turant bhi skip
+     karaya ja sakta hai.
 """
 import os
-import re
 import sys
 import json
 import time
 import random
 import shutil
 import zipfile
-import subprocess
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -49,10 +42,13 @@ IG_USER_ID = os.environ.get("IG_USER_ID", "")
 IG_ACCESS_TOKEN = os.environ.get("IG_ACCESS_TOKEN", "")
 GRAPH_VER = "v21.0"
 
-REELS_MAX_PER_RUN = int(os.environ.get("REELS_MAX_PER_RUN", "4"))
-IG_SAFETY_MARGIN = 2             # IG ke live-reported total me se itna margin rakho
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
 
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+REELS_MAX_PER_RUN = int(os.environ.get("REELS_MAX_PER_RUN", "4"))
+MAX_RUN_LEVEL_RETRIES = 8
+IG_SAFETY_MARGIN = 2
+
 WORK = "reels_work"
 os.makedirs(WORK, exist_ok=True)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -80,10 +76,12 @@ def tg(msg):
 
 
 def wipe_work():
-    keep = {os.path.abspath(p) for p in _master_cache.values() if p}
+    """Sirf current series ke extracted parts cache ke alawa sab saaf karo,
+    taaki isi run ke andar baar-baar wahi artifact dobara download na ho."""
+    keep_dir = os.path.abspath(os.path.join(WORK, "parts"))
     for f in os.listdir(WORK):
         p = os.path.join(WORK, f)
-        if os.path.abspath(p) in keep:
+        if os.path.abspath(p) == keep_dir:
             continue
         try:
             os.remove(p) if os.path.isfile(p) else shutil.rmtree(p)
@@ -131,7 +129,7 @@ def pending_rows(reels_q):
     """Returns list of (row_number, dict) for rows with status == 'pending', oldest first."""
     values = reels_q.get_all_values()
     out = []
-    for i, row in enumerate(values[1:], start=2):  # row 1 = header
+    for i, row in enumerate(values[1:], start=2):
         row = row + [""] * (len(COLS) - len(row))
         d = dict(zip(COLS, row))
         if d.get("status", "").strip().lower() == "pending" and d.get("yt_id"):
@@ -169,24 +167,22 @@ def ig_quota_remaining():
         return 0
 
 
-# ---------------- MASTER VIDEO SOURCE ----------------
-# Priority 1: pipeline.py ne jo master video GitHub Actions "artifact" ke roop
-# me save kiya tha, wahi use karo — koi dobara download nahi, koi cookies nahi.
-# Priority 2 (fallback, tabhi jab artifact expire/missing ho): sheet me stored
-# ORIGINAL input link (FB wala) se yt-dlp se nikalo — YouTube link se NAHI,
-# taaki YouTube ka bot-block wala jhanjhat hi na aaye.
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
-_master_cache = {}  # yt_id -> local file path, isi run ke andar dobara fetch na ho
+# ---------------- READY-MADE PARTS ARTIFACT ----------------
+_parts_cache = {}  # yt_id -> {part_no: local_path}, isi run me dobara fetch na ho
 
 
-def fetch_master_artifact(yt_id):
-    if yt_id in _master_cache:
-        return _master_cache[yt_id]
+def fetch_parts_artifact(yt_id):
+    """pipeline.py ne banaye hue 'parts-<yt_id>' artifact ko ek baar download
+    karke extract karta hai, aur {part_number: file_path} dict return karta
+    hai. Isi run ke andar cached rehta hai taaki baar-baar download na ho."""
+    if yt_id in _parts_cache:
+        return _parts_cache[yt_id]
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        _master_cache[yt_id] = None
-        return None
-    name = f"master-{yt_id}"
+        log("GITHUB_TOKEN/GITHUB_REPOSITORY nahi mile — parts artifact fetch nahi ho sakta.")
+        _parts_cache[yt_id] = {}
+        return {}
+
+    name = f"parts-{yt_id}"
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
     try:
         r = requests.get(
@@ -196,105 +192,37 @@ def fetch_master_artifact(yt_id):
         r.raise_for_status()
         arts = [a for a in r.json().get("artifacts", []) if not a.get("expired")]
         if not arts:
-            log(f"Artifact '{name}' nahi mila (expire ho gaya ya abhi bana nahi) — fallback use hoga.")
-            _master_cache[yt_id] = None
-            return None
+            log(f"Artifact '{name}' nahi mila (abhi bana nahi ya expire ho gaya).")
+            _parts_cache[yt_id] = {}
+            return {}
         art = sorted(arts, key=lambda a: a["created_at"], reverse=True)[0]
         dl = requests.get(art["archive_download_url"], headers=headers, timeout=600)
         dl.raise_for_status()
-        zpath = os.path.join(WORK, f"{yt_id}_artifact.zip")
+
+        extract_dir = os.path.join(WORK, "parts", yt_id)
+        os.makedirs(extract_dir, exist_ok=True)
+        zpath = os.path.join(WORK, f"{yt_id}_parts.zip")
         with open(zpath, "wb") as f:
             f.write(dl.content)
         with zipfile.ZipFile(zpath) as z:
-            mp4_names = [n for n in z.namelist() if n.endswith(".mp4")]
-            if not mp4_names:
-                _master_cache[yt_id] = None
-                return None
-            z.extract(mp4_names[0], WORK)
-            local_path = os.path.join(WORK, mp4_names[0])
-        log(f"Artifact '{name}' se master mil gaya (dobara download nahi hua).")
-        _master_cache[yt_id] = local_path
-        return local_path
+            z.extractall(extract_dir)
+        os.remove(zpath)
+
+        parts = {}
+        for fn in os.listdir(extract_dir):
+            if fn.startswith("part_") and fn.endswith(".mp4"):
+                try:
+                    num = int(fn[5:8])
+                    parts[num] = os.path.join(extract_dir, fn)
+                except ValueError:
+                    continue
+        log(f"Artifact '{name}' se {len(parts)} parts mil gaye.")
+        _parts_cache[yt_id] = parts
+        return parts
     except Exception as e:
         log(f"Artifact fetch fail ({name}): {e}")
-        _master_cache[yt_id] = None
-        return None
-
-
-def get_master_source(d):
-    """Local file path (preferred) ya remote direct-URL (fallback) return karta hai."""
-    local = fetch_master_artifact(d["yt_id"])
-    if local:
-        return local
-    source_url = d.get("source_url") or d.get("yt_link")
-    log(f"Fallback: original source link se nikal raha hoon: {source_url}")
-    return get_direct_url(source_url)
-
-
-# ---------------- YT DIRECT URL ----------------
-def get_direct_url(yt_link):
-    cmd = ["yt-dlp", "-f", "b[height<=720]/b", "-g"]
-    if os.path.exists("cookies.txt"):
-        cmd += ["--cookies", "cookies.txt"]
-    cmd.append(yt_link)
-    last_err = ""
-    for attempt in range(3):
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        urls = [u for u in (r.stdout or "").strip().splitlines() if u.startswith("http")]
-        if r.returncode == 0 and urls:
-            return urls[0]
-        last_err = (r.stderr or "")[-300:]
-        log(f"yt-dlp direct URL attempt {attempt + 1} fail, retrying in 20s: {last_err}")
-        time.sleep(20)
-    raise RuntimeError(f"yt-dlp direct URL fail after retries: {last_err}")
-
-
-# ---------------- CUT + VERTICAL LETTERBOX ----------------
-def _dt_escape(s):
-    """ffmpeg drawtext ke liye khatarnak characters hata do (colon/%/backslash/quote)."""
-    return re.sub(r"[:%\\']", "", str(s))
-
-
-def cut_reel_part(input_src, offset_sec, dur_sec, part_no, total_parts, title=""):
-    out = os.path.join(WORK, f"part_{part_no}.mp4")
-    label = _dt_escape(f"Part {part_no}/{total_parts}")
-    title_display = _dt_escape(title)[:42]
-    if len(title) > 42:
-        title_display += "..."
-
-    vf = (
-        "scale=w=1080:h=1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-        # Part number — ab top edge se thoda niche (pehle bohot upar chipka tha)
-        f"drawtext=fontfile={FONT}:text='{label}':x=(w-text_w)/2:y=300:"
-        "fontsize=52:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=12,"
-        # Title — Part number ke thoda niche, chhote font me
-        f"drawtext=fontfile={FONT}:text='{title_display}':x=(w-text_w)/2:y=380:"
-        "fontsize=32:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=8,"
-        # Yellow watermark — video ke niche (bottom black bar me)
-        f"drawtext=fontfile={FONT}:text='@trending_shots_ai':x=(w-text_w)/2:y=h-100:"
-        "fontsize=38:fontcolor=yellow"
-    )
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-ss", str(offset_sec), "-i", input_src, "-t", str(dur_sec),
-        "-vf", vf,
-        # IG Reels spec: fixed frame rate, closed GOP of 2-5s, H.264, 4:2:0.
-        # Generic "ProcessingFailedError" is commonly caused by videos that
-        # don't strictly match these (variable frame rate, open/long GOP,
-        # or audio not at 48kHz) even though the file "looks" fine otherwise.
-        "-r", "30", "-g", "60", "-sc_threshold", "0", "-bf", "2",
-        "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high",
-        "-crf", "23", "-maxrate", "6M", "-bufsize", "12M",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "128k",
-        "-movflags", "+faststart", out,
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if r.returncode != 0 or not os.path.exists(out):
-        raise RuntimeError(f"ffmpeg cut failed: {(r.stderr or '')[-400:]}")
-    return out
-
+        _parts_cache[yt_id] = {}
+        return {}
 
 
 # ---------------- IG REELS UPLOAD ----------------
@@ -308,10 +236,6 @@ def _ig_upload_once(video_path, caption):
     if "id" not in r:
         raise RuntimeError(f"IG container create failed: {r}")
     container_id = r["id"]
-    # IMPORTANT: IG kabhi-kabhi container-creation response me hi ek "uri" deta
-    # hai jahan actual bytes bhejne hai. Agar hum ye ignore karke khud URL
-    # banate hai aur wo mismatch ho jaye, to video kabhi upload hi nahi hota
-    # aur container hamesha "IN_PROGRESS" me atka reh jata hai (yahi asli bug tha).
     upload_url = r.get("uri") or f"https://rupload.facebook.com/ig-api-upload/{GRAPH_VER}/{container_id}"
     log(f"IG container created: {container_id} | upload_url={upload_url}")
 
@@ -331,9 +255,6 @@ def _ig_upload_once(video_path, caption):
         up_json = {"raw_text": up.text[:300], "status_code": up.status_code}
     log(f"IG binary upload response ({up.status_code}): {up_json}")
     if up.status_code >= 400 or up_json.get("success") is False:
-        # Meta ke server-side ka ek jaana-maana transient glitch: "ProcessingFailedError /
-        # Request processing failed" — same tarah ki file kabhi chal jati hai kabhi nahi.
-        # Isliye caller (ig_upload_reel) isko naye container ke saath retry karega.
         raise RuntimeError(f"IG binary upload failed: {up_json}")
 
     last_status = {}
@@ -345,7 +266,7 @@ def _ig_upload_once(video_path, caption):
             timeout=30,
         ).json()
         code = last_status.get("status_code")
-        if i % 3 == 0:  # har 30 sec me ek baar log karo, spam nahi
+        if i % 3 == 0:
             log(f"IG container {container_id} poll {i}: {last_status}")
         if code == "FINISHED":
             break
@@ -387,10 +308,6 @@ def build_caption(d, part_no, total_parts):
 
 
 def main():
-    if os.environ.get("YT_COOKIES"):
-        with open("cookies.txt", "w") as f:
-            f.write(os.environ["YT_COOKIES"])
-
     if not (IG_USER_ID and IG_ACCESS_TOKEN):
         log("IG credentials nahi mile — kuch karne layak nahi.")
         return 0
@@ -401,30 +318,20 @@ def main():
         tg(f"❌ ReelsQueue sheet open nahi hui: {e}")
         raise
 
-    # ---- Din me sirf EK series: aaj ka "active" video lock karo ----
-    today = datetime.now(IST).strftime("%Y-%m-%d")
     state = get_state(state_ws)
     active_yt_id = state.get("active_yt_id", "")
+    row_num, d = (find_row_by_yt_id(reels_q, active_yt_id) if active_yt_id else (None, None))
 
-    if state.get("active_date") != today:
-        # Naya din — agla (sabse purana pending) video is din ke liye lock karo.
+    if not d or d.get("status", "").strip().lower() == "done":
         rows = pending_rows(reels_q)
-        active_yt_id = rows[0][1]["yt_id"] if rows else ""
-        set_state(state_ws, "active_date", today)
+        if not rows:
+            set_state(state_ws, "active_yt_id", "")
+            tg("📭 Koi pending video nahi hai ReelsQueue me.")
+            return 0
+        row_num, d = rows[0]
+        active_yt_id = d["yt_id"]
         set_state(state_ws, "active_yt_id", active_yt_id)
-        log(f"Naya din — aaj ka series lock kiya: {active_yt_id or '(koi pending video nahi)'}")
-
-    if not active_yt_id:
-        tg("📭 Koi pending video nahi hai ReelsQueue me.")
-        return 0
-
-    row_num, d = find_row_by_yt_id(reels_q, active_yt_id)
-    if not d:
-        log(f"Active series {active_yt_id} ReelsQueue me nahi mila (delete ho gaya?).")
-        return 0
-    if d.get("status", "").strip().lower() == "done":
-        tg(f"✅ Aaj ka series ({d.get('title')}) pehle hi poora ho chuka hai. Kal agla series shuru hoga.")
-        return 0
+        log(f"Active series set: {active_yt_id} ({d.get('title')})")
 
     posted_ig, failed = 0, 0
 
@@ -439,8 +346,6 @@ def main():
             log("Aaj ka series poora ho gaya.")
             break
 
-        duration = float(d.get("duration") or 0)
-        part_sec = int(float(d.get("part_sec") or 85))
         total_parts = int(float(d.get("total_parts") or 1))
         next_index = int(float(d.get("next_index") or 1))
 
@@ -448,56 +353,63 @@ def main():
             reels_q.update_cell(row_num, COLS.index("status") + 1, "done")
             break
 
-        offset = (next_index - 1) * part_sec
-        this_dur = min(part_sec, duration - offset)
-        if this_dur < 15:
-            reels_q.update_cell(row_num, COLS.index("status") + 1, "done")
-            break
+        hint_val = (d.get("hint") or "").strip()
 
-        did_upload_attempt = False
+        if hint_val.lower() == "skip":
+            log(f"Part {next_index} manually 'skip' marked hai sheet me — aage badh raha hoon.")
+            tg(f"⏭️ Part {next_index}/{total_parts} ({d['title']}) manually skip kiya gaya.")
+            new_index = next_index + 1
+            reels_q.update_cell(row_num, COLS.index("next_index") + 1, new_index)
+            reels_q.update_cell(row_num, COLS.index("hint") + 1, "")
+            if new_index > total_parts:
+                reels_q.update_cell(row_num, COLS.index("status") + 1, "done")
+            continue
+
+        parts = fetch_parts_artifact(active_yt_id)
+        clip = parts.get(next_index)
+        if not clip:
+            log(f"Part {next_index} ka ready file artifact me nahi mila — agla run try karega.")
+            tg(f"⚠️ Part {next_index}/{total_parts} ({d['title']}) ka ready file abhi nahi mila "
+               f"(shayad pipeline.py abhi chal raha hai ya artifact expire ho gaya).")
+            failed += 1
+            if failed >= 2:
+                break
+            continue
+
         try:
-            input_src = get_master_source(d)
-            clip = cut_reel_part(input_src, offset, this_dur, next_index, total_parts, d.get("title", ""))
             caption = build_caption(d, next_index, total_parts)
+            ig_id = ig_upload_reel(clip, caption)
+            hist.append_row([now_ist(), d["yt_link"], "SUCCESS", ig_id, d["title"], "", "IG_REEL"])
+            posted_ig += 1
 
-            did_upload_attempt = True
-            try:
-                ig_id = ig_upload_reel(clip, caption)
-                hist.append_row([now_ist(), d["yt_link"], "SUCCESS", ig_id, d["title"], "", "IG_REEL"])
-                posted_ig += 1
+            new_index = next_index + 1
+            reels_q.update_cell(row_num, COLS.index("next_index") + 1, new_index)
+            reels_q.update_cell(row_num, COLS.index("hint") + 1, "")
+            if new_index > total_parts:
+                reels_q.update_cell(row_num, COLS.index("status") + 1, "done")
 
+        except Exception as e:
+            hist.append_row([now_ist(), d["yt_link"], "FAILED", "", d["title"], str(e)[:300], "IG_REEL"])
+            retries = int(hint_val) + 1 if hint_val.isdigit() else 1
+
+            if retries >= MAX_RUN_LEVEL_RETRIES:
+                log(f"Part {next_index} {retries} alag runs me fail ho chuka — skip kar raha hoon.")
+                tg(f"⚠️ Part {next_index}/{total_parts} ({d['title']}) {retries} baar fail hua, "
+                   f"ye part genuinely kharab lag raha hai — skip kiya, series aage badh raha hai.")
                 new_index = next_index + 1
                 reels_q.update_cell(row_num, COLS.index("next_index") + 1, new_index)
                 reels_q.update_cell(row_num, COLS.index("hint") + 1, "")
                 if new_index > total_parts:
                     reels_q.update_cell(row_num, COLS.index("status") + 1, "done")
-
-            except Exception as e:
-                hist.append_row([now_ist(), d["yt_link"], "FAILED", "", d["title"], str(e)[:300], "IG_REEL"])
-                retries = int((d.get("hint") or "0").strip() or 0) + 1
+            else:
                 reels_q.update_cell(row_num, COLS.index("hint") + 1, str(retries))
-                # IMPORTANT: index KABHI nahi badhta jab tak upload safal na ho —
-                # taaki series me koi part permanently gayab na ho. Agar yehi
-                # part baar-baar fail ho raha hai (Meta ka apna transient
-                # "ProcessingFailedError"), agla scheduled run phir try karega.
                 tg(f"❌ IG Reel FAILED (Part {next_index}/{total_parts}, {d['title']}, "
-                   f"ab tak {retries} baar fail) — agla run phir try karega:\n{str(e)[:300]}")
-                failed += 1
-                if failed >= 2:
-                    break
-
-        except Exception as e:
+                   f"ab tak {retries}/{MAX_RUN_LEVEL_RETRIES} baar fail) — agla run phir try karega:\n{str(e)[:300]}")
             failed += 1
-            log(f"Part {next_index} processing failed: {e}")
-            tg(f"❌ Reel part processing FAILED ({d.get('title')}, part {next_index}):\n{str(e)[:300]}")
             if failed >= 2:
                 break
-        finally:
-            wipe_work()
 
-        # Spam na lage isliye har upload attempt ke baad random gap (30-180 sec),
-        # agle part se pehle. Last iteration ke baad rukne ki zaroorat nahi.
-        if did_upload_attempt and i < REELS_MAX_PER_RUN - 1:
+        if i < REELS_MAX_PER_RUN - 1:
             gap = random.randint(30, 180)
             log(f"Agle part se pehle {gap}s ruk raha hoon (anti-spam pacing)...")
             time.sleep(gap)
