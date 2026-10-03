@@ -50,11 +50,11 @@ jobs:
           FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
         run: python pipeline.py
 
-      - name: Upload master video as artifact (for reels.py)
+      - name: Upload ready-made reel parts as artifact (for reels.py)
         if: success() && steps.run_pipeline.outputs.yt_id != ''
         uses: actions/upload-artifact@v4
         with:
-          name: master-${{ steps.run_pipeline.outputs.yt_id }}
-          path: artifact_out/${{ steps.run_pipeline.outputs.yt_id }}.mp4
-          retention-days: 3
+          name: parts-${{ steps.run_pipeline.outputs.yt_id }}
+          path: artifact_out/parts/
+          retention-days: 5
           compression-level: 0
