@@ -25,13 +25,6 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-
-      - name: Install ffmpeg + fonts
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
-
       - name: Install Python deps
         run: pip install -r requirements.txt
 
@@ -41,7 +34,6 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          YT_COOKIES: ${{ secrets.YT_COOKIES }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
