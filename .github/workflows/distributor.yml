@@ -1,0 +1,43 @@
+# Repo me is path par rakho:  .github/workflows/distributor.yml
+name: Distributor (YouTube + Facebook)
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"   # har 3 ghante — 5/day cap ke liye kaafi runs
+  workflow_dispatch:
+
+concurrency:
+  group: distributor-pipeline
+  cancel-in-progress: false
+
+jobs:
+  distribute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Run distributor
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          YT_TOKEN_JSON: ${{ secrets.YT_TOKEN_JSON }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DAILY_CAP: "5"
+          PARTS_PER_RUN: "2"
+        run: python distributor.py
