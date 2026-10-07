@@ -1,5 +1,5 @@
 # Repo me is path par rakho:  .github/workflows/daily.yml
-name: Daily YouTube + FB Uploads
+name: Ingestion Pipeline
 
 on:
   schedule:
@@ -11,11 +11,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: yt-pipeline
+  group: ingestion-pipeline
   cancel-in-progress: false
 
 jobs:
-  upload:
+  ingest:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -36,7 +36,7 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Run pipeline
+      - name: Run ingestion pipeline
         id: run_pipeline
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -44,17 +44,14 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          YT_TOKEN_JSON: ${{ secrets.YT_TOKEN_JSON }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
-          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
         run: python pipeline.py
 
-      - name: Upload ready-made reel parts as artifact (for reels.py)
-        if: success() && steps.run_pipeline.outputs.yt_id != ''
+      - name: Upload ready-made parts as artifact (for distributor.py)
+        if: success() && steps.run_pipeline.outputs.series_id != ''
         uses: actions/upload-artifact@v4
         with:
-          name: parts-${{ steps.run_pipeline.outputs.yt_id }}
+          name: parts-${{ steps.run_pipeline.outputs.series_id }}
           path: artifact_out/parts/
-          retention-days: 5
+          retention-days: 30
           compression-level: 0
