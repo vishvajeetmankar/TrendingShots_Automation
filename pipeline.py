@@ -342,7 +342,7 @@ def upload_youtube(video_path, title, desc, tags):
     yt = yt_service()
     body = {
         "snippet": {"title": title, "description": desc, "tags": tags, "categoryId": "24"},
-        "status": {"privacyStatus": PUBLIC, "selfDeclaredMadeForKids": False},
+        "status": {"privacyStatus": PRIVACY, "selfDeclaredMadeForKids": False},
     }
     media = MediaFileUpload(video_path, chunksize=8 * 1024 * 1024, resumable=True, mimetype="video/mp4")
     req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
