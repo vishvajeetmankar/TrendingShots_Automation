@@ -1,5 +1,5 @@
 """
-Shared SEO helpers — pipeline.py aur reels.py dono isse import karte hai.
+Shared SEO helpers — pipeline.py aur distributor.py dono isse import karte hai.
 
 Goal: AI kabhi-kabhi ajeeb/invented hashtags bana deta hai (jo kabhi search hi
 nahi hote). Isko rokne ke 2 layers hai:
@@ -7,32 +7,29 @@ nahi hote). Isko rokne ke 2 layers hai:
      nahi), tag = 1-4 simple lowercase words. Isse garbled/gibberish reject ho
      jata hai.
   2. CURATED FALLBACK POOL — ye asli, commonly-used English hashtags/keywords
-     hai (reels/story/animation niche ke liye). AI ke saaf-filtered output ko
+     hai (general viral/story content ke liye). AI ke saaf-filtered output ko
      inhi ke saath merge karke final list banti hai, taaki list hamesha
      "real" tags se bhari rahe.
-Note: ye "abhi live trending kya hai" guarantee nahi karta — uske liye ek paid
-trend-API (jaise Google Trends scraper ya TikTok/IG trend tool) chahiye hoga.
-Ye sirf invented/nonsense tags ka risk kam karta hai.
+Note: ye "abhi live trending kya hai" guarantee nahi karta — ye sirf
+invented/nonsense tags ka risk kam karta hai.
 """
 import re
 
 CURATED_HASHTAGS = [
-    "reels", "reelsinstagram", "instareels", "reelitfeelit", "trending",
-    "viral", "viralreels", "explorepage", "explore", "fyp", "foryou",
-    "foryoupage", "reelsvideo", "reelsdaily", "trendingreels", "viralvideo",
-    "shortvideo", "story", "storytime", "animation", "cartoon", "2danimation",
-    "animatedstory", "moralstory", "suspense", "suspensestory", "thriller",
-    "mystery", "mysterystory", "drama", "dramaseries", "webseries",
-    "emotionalstory", "plottwist", "cliffhanger", "mustwatch", "watchtillend",
-    "hindistory", "animatedseries", "shortstory", "binge",
+    "viral", "trending", "shorts", "fyp", "foryou", "foryoupage",
+    "mustwatch", "watchtillend", "plottwist", "cliffhanger", "storytime",
+    "story", "shortstory", "truestory", "viralvideo", "trendingnow",
+    "explore", "explorepage", "recommended", "binge", "series",
+    "episode", "drama", "suspense", "thriller", "mystery", "emotional",
+    "lifestory", "realstory", "crazystory", "wow", "shocking", "unbelievable",
 ]
 
 CURATED_TAGS = [
-    "hindi story", "animated story", "moral story", "suspense story",
-    "mystery story", "thriller story", "drama series", "web series",
-    "story time", "plot twist", "emotional story", "trending reels",
-    "viral reels", "reels india", "cartoon story", "2d animation",
-    "animated series", "hindi web series", "short story", "must watch",
+    "true story", "short story", "story time", "plot twist", "viral video",
+    "trending video", "must watch", "mystery story", "suspense story",
+    "thriller story", "drama series", "web series", "emotional story",
+    "shocking story", "real story", "crazy story", "viral story",
+    "binge watch", "episode series", "story series",
 ]
 
 _HASHTAG_RE = re.compile(r"^[a-z0-9]{2,25}$")
