@@ -36,7 +36,7 @@ import gspread
 from groq import Groq
 
 from seo_utils import clean_hashtags, clean_tags
-from video_utils import make_part, probe_dimensions
+from video_utils import make_part, probe_dimensions, add_recap_outro
 
 # ---------------- CONFIG ----------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -330,12 +330,17 @@ def fallback_metadata():
 
 
 # ---------------- 5. CUT INTO 10-MIN PARTS ----------------
-def prepare_parts(edited_path, duration, series_id):
+def prepare_parts(edited_path, duration, series_id, title="", description=""):
     """Poore video ko 10-min parts me kaatta hai. Aakhri bacha hua tukda
-    (remainder) alag chhota part nahi banta — last part me hi jud jata hai."""
+    (remainder) alag chhota part nahi banta — last part me hi jud jata hai.
+    Har part me random fingerprint-variation lagta hai, aur end me ~1 min ka
+    freeze-frame + voice recap outro jodta hai (outro fail ho to part bina
+    outro ke hi ship hota hai, poora pipeline nahi rukta)."""
     total_parts = max(1, int(duration // PART_SECONDS))
     parts_dir = os.path.join(ARTIFACT_DIR, "parts")
     os.makedirs(parts_dir, exist_ok=True)
+    tmp_dir = os.path.join(WORK, "partstmp")
+    os.makedirs(tmp_dir, exist_ok=True)
 
     width, height = probe_dimensions(edited_path)
     log(f"Source dimensions: {width}x{height} | {total_parts} parts banenge (~{PART_SECONDS // 60} min each)")
@@ -345,13 +350,24 @@ def prepare_parts(edited_path, duration, series_id):
         offset = (i - 1) * PART_SECONDS
         # Aakhri part poora bacha hua duration le leta hai (remainder absorb).
         this_dur = (duration - offset) if i == total_parts else PART_SECONDS
-        out_path = os.path.join(parts_dir, f"part_{i:03d}.mp4")
+        final_path = os.path.join(parts_dir, f"part_{i:03d}.mp4")
+        raw_part = os.path.join(tmp_dir, f"part_{i:03d}_main.mp4")
         try:
-            make_part(edited_path, offset, this_dur, i, total_parts, out_path, width, height)
+            _, (cw, ch) = make_part(edited_path, offset, this_dur, i, total_parts, raw_part, width, height)
+            try:
+                add_recap_outro(raw_part, title, description, final_path, cw, ch)
+                log(f"Part {i}/{total_parts} taiyar (recap outro ke saath, {this_dur:.0f}s main)")
+            except Exception as e:
+                log(f"Part {i} recap outro fail ({e}) — bina outro ke ship kar raha hoon.")
+                shutil.copy(raw_part, final_path)
             parts_made += 1
-            log(f"Part {i}/{total_parts} taiyar ({this_dur:.0f}s)")
         except Exception as e:
             log(f"Part {i} banane me fail hua (skip): {e}")
+        finally:
+            try:
+                os.remove(raw_part)
+            except OSError:
+                pass
     log(f"{parts_made}/{total_parts} parts taiyar ho gaye.")
     return total_parts
 
@@ -389,7 +405,7 @@ def process(url, parts_q):
     series_id = uuid.uuid4().hex[:12]
     total_parts = 0
     try:
-        total_parts = prepare_parts(edited, duration, series_id)
+        total_parts = prepare_parts(edited, duration, series_id, title, description)
         parts_q.append_row([
             now_ist(), series_id, title, description,
             json.dumps(hashtags, ensure_ascii=False), json.dumps(tags, ensure_ascii=False),
