@@ -36,7 +36,7 @@ import gspread
 from groq import Groq
 
 from seo_utils import clean_hashtags, clean_tags
-from video_utils import make_part, probe_dimensions, add_recap_outro
+from video_utils import make_part, probe_dimensions, probe_fps, add_recap_outro
 
 # ---------------- CONFIG ----------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -166,16 +166,20 @@ def download(url):
 
 # ---------------- 2. LIGHT EDIT (speed-up only, no mirror, no colorgrade) ----------------
 def edit(raw):
-    """Sirf speed-up karta hai. Mirror hata diya gaya hai. Color-grade/zoom/
-    overlay ab PART-level par hoti hai (make_part), taaki poore lambe video
-    par ye heavy filters na chalein — sirf 10-min chunks par chalein."""
+    """Sirf speed-up karta hai (mirror/color/zoom/captions part-level par hote
+    hai). SYNC FIX: setpts se video compress hone ke baad fps filter se frames
+    sahi jagah rakhte hai (sirf encoder ke vsync par chhodne se video kuch
+    frames late reh jata tha), aur audio ko 48kHz par normalize karte hai taaki
+    aage ke pitch-trick ka sample-rate assumption sahi rahe."""
     out = os.path.join(WORK, "edited.mp4")
-    vf = f"setpts=PTS/{SPEED_FACTOR}"
-    af = f"atempo={SPEED_FACTOR}" if SPEED_FACTOR <= 2.0 else f"atempo=2.0,atempo={SPEED_FACTOR / 2.0}"
+    fps_str, _ = probe_fps(raw)
+    vf = f"setpts=PTS/{SPEED_FACTOR},fps={fps_str}:round=near"
+    atempo = f"atempo={SPEED_FACTOR}" if SPEED_FACTOR <= 2.0 else f"atempo=2.0,atempo={SPEED_FACTOR / 2.0}"
+    af = f"aresample=48000,{atempo},aresample=async=1:first_pts=0"
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", raw, "-vf", vf, "-af", af,
         "-map_metadata", "-1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-b:a", "160k",
         "-movflags", "+faststart", out,
     ]
     t = time.time()
@@ -196,22 +200,102 @@ def probe_duration(path):
 
 
 # ---------------- 3. TRANSCRIBE (Groq Whisper, first 10 min) ----------------
-def transcribe(raw):
-    audio = os.path.join(WORK, "audio.mp3")
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", raw, "-t", str(TRANSCRIBE_MAX_SECONDS),
-           "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "48k", audio]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 or not os.path.exists(audio):
-        raise RuntimeError(f"Audio extract failed: {(r.stderr or '')[-300:]}")
+def _w_get(w, key, default=None):
+    if isinstance(w, dict):
+        return w.get(key, default)
+    return getattr(w, key, default)
+
+
+def _extract_words(res, chunk_offset):
+    """Groq verbose_json response se word list nikalta hai (dict ya object,
+    dono handle). Word-timestamps na mile to segments ko characters ke hisaab
+    se words me baant deta hai."""
+    out = []
+    words = _w_get(res, "words")
+    if words:
+        for w in words:
+            try:
+                out.append({"word": str(_w_get(w, "word", "")).strip(),
+                            "start": float(_w_get(w, "start")) + chunk_offset,
+                            "end": float(_w_get(w, "end")) + chunk_offset})
+            except (TypeError, ValueError):
+                continue
+        if out:
+            return out
+    for seg in (_w_get(res, "segments") or []):
+        try:
+            s0, s1 = float(_w_get(seg, "start")), float(_w_get(seg, "end"))
+        except (TypeError, ValueError):
+            continue
+        toks = str(_w_get(seg, "text", "")).split()
+        if not toks:
+            continue
+        total = sum(len(t) for t in toks) or 1
+        t = s0
+        for tok in toks:
+            d = (s1 - s0) * len(tok) / total
+            out.append({"word": tok, "start": t + chunk_offset, "end": t + d + chunk_offset})
+            t += d
+    return out
+
+
+def transcribe_full(edited_path, duration):
+    """POORE video ka word-level transcript (captions + metadata dono ke liye).
+    Audio 10-10 min ke chunks me Groq Whisper ko bheja jata hai (file-size/
+    rate-limit safe). Timestamps edited-video ki timeline me hote hai, jo
+    seedha part offsets se match karti hai. Koi chunk fail ho to wo skip hota
+    hai (us hisse me captions nahi aayenge), poora pipeline nahi rukta."""
     client = Groq(api_key=GROQ_API_KEY)
-    kwargs = dict(model=WHISPER_MODEL, response_format="json")
-    if WHISPER_LANG:
-        kwargs["language"] = WHISPER_LANG
-    with open(audio, "rb") as f:
-        res = client.audio.transcriptions.create(file=("audio.mp3", f.read()), **kwargs)
-    text = res if isinstance(res, str) else res.text
-    log(f"Transcript ready ({len(text)} chars)")
-    return text
+    chunk_len = 600
+    all_words = []
+    n_chunks = max(1, int(-(-duration // chunk_len)))
+    for k in range(n_chunks):
+        off = k * chunk_len
+        audio = os.path.join(WORK, f"chunk_{k:03d}.mp3")
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(off), "-t", str(chunk_len),
+               "-i", edited_path, "-vn", "-ac", "1", "-ar", "16000",
+               "-c:a", "libmp3lame", "-b:a", "48k", audio]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(audio):
+            log(f"Chunk {k} audio extract fail: {(r.stderr or '')[-200:]}")
+            continue
+        kwargs = dict(model=WHISPER_MODEL, response_format="verbose_json",
+                      timestamp_granularities=["word", "segment"])
+        if WHISPER_LANG:
+            kwargs["language"] = WHISPER_LANG
+        done = False
+        for attempt in range(1, 6):
+            try:
+                with open(audio, "rb") as f:
+                    res = client.audio.transcriptions.create(file=(f"chunk{k}.mp3", f.read()), **kwargs)
+                words = _extract_words(res, off)
+                all_words.extend(words)
+                log(f"Transcribe chunk {k + 1}/{n_chunks}: {len(words)} words")
+                done = True
+                break
+            except Exception as e:
+                msg = str(e)
+                log(f"Transcribe chunk {k} attempt {attempt} fail: {msg[:160]}")
+                if "429" in msg or "rate" in msg.lower():
+                    m = re.search(r"try again in (?:(\d+)m)?(?:([\d.]+)s)?", msg)
+                    wait = 30 * attempt
+                    if m and (m.group(1) or m.group(2)):
+                        wait = int(m.group(1) or 0) * 60 + int(float(m.group(2) or 0)) + 3
+                    time.sleep(min(wait, 400))
+                else:
+                    time.sleep(5 * attempt)
+        if not done:
+            log(f"Chunk {k} transcribe nahi ho paya — is hisse me captions nahi honge.")
+        try:
+            os.remove(audio)
+        except OSError:
+            pass
+    log(f"Total {len(all_words)} words transcribed.")
+    return all_words
+
+
+def text_of_first_seconds(words, seconds):
+    return " ".join(w["word"] for w in words if w["start"] < seconds).strip()
 
 
 # ---------------- 4. METADATA (Groq LLM, ENGLISH only) ----------------
@@ -330,7 +414,7 @@ def fallback_metadata():
 
 
 # ---------------- 5. CUT INTO 10-MIN PARTS ----------------
-def prepare_parts(edited_path, duration, series_id, title="", description=""):
+def prepare_parts(edited_path, duration, series_id, title="", description="", words=None):
     """Poore video ko 10-min parts me kaatta hai. Aakhri bacha hua tukda
     (remainder) alag chhota part nahi banta — last part me hi jud jata hai.
     Har part me random fingerprint-variation lagta hai, aur end me ~1 min ka
@@ -353,10 +437,11 @@ def prepare_parts(edited_path, duration, series_id, title="", description=""):
         final_path = os.path.join(parts_dir, f"part_{i:03d}.mp4")
         raw_part = os.path.join(tmp_dir, f"part_{i:03d}_main.mp4")
         try:
-            _, (cw, ch) = make_part(edited_path, offset, this_dur, i, total_parts, raw_part, width, height)
+            _, (cw, ch), cap_note = make_part(edited_path, offset, this_dur, i, total_parts,
+                                              raw_part, width, height, words=words)
             try:
                 add_recap_outro(raw_part, title, description, final_path, cw, ch)
-                log(f"Part {i}/{total_parts} taiyar (recap outro ke saath, {this_dur:.0f}s main)")
+                log(f"Part {i}/{total_parts} taiyar ({cap_note}, recap outro ke saath, {this_dur:.0f}s main)")
             except Exception as e:
                 log(f"Part {i} recap outro fail ({e}) — bina outro ke ship kar raha hoon.")
                 shutil.copy(raw_part, final_path)
@@ -387,13 +472,21 @@ def process(url, parts_q):
     edited = edit(raw)
     duration = probe_duration(edited)
 
+    # Poore video ka word-level transcript — captions ke liye bhi, aur
+    # pehle 10 min ka text metadata ke liye bhi (alag se dobara transcribe nahi).
+    words = []
+    try:
+        words = transcribe_full(edited, duration)
+    except Exception as e:
+        log(f"Full transcription fail (captions nahi honge): {e}")
+
     meta = None
     try:
-        transcript = transcribe(raw)
+        transcript = text_of_first_seconds(words, TRANSCRIBE_MAX_SECONDS)
         if transcript.strip():
             meta = generate_metadata(transcript)
     except Exception as e:
-        log(f"Transcribe/metadata step fail (default metadata use hoga): {e}")
+        log(f"Metadata step fail (default metadata use hoga): {e}")
     if not meta:
         meta = fallback_metadata()
 
@@ -405,7 +498,7 @@ def process(url, parts_q):
     series_id = uuid.uuid4().hex[:12]
     total_parts = 0
     try:
-        total_parts = prepare_parts(edited, duration, series_id, title, description)
+        total_parts = prepare_parts(edited, duration, series_id, title, description, words)
         parts_q.append_row([
             now_ist(), series_id, title, description,
             json.dumps(hashtags, ensure_ascii=False), json.dumps(tags, ensure_ascii=False),
