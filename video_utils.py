@@ -77,6 +77,15 @@ def probe_fps(path):
     return "30/1", 30.0
 
 
+def has_audio(path):
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+        capture_output=True, text=True,
+    )
+    return "audio" in (r.stdout or "")
+
+
 def probe_media_duration(path):
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
@@ -149,7 +158,11 @@ def build_cues(words, offset, dur, speed, max_chars, tail_guard):
         start = ch[0][0]
         end = ch[-1][1] + 0.15
         if i + 1 < len(chunks):
-            end = min(end, chunks[i + 1][0][0] - 0.02)
+            nxt = chunks[i + 1][0][0]
+            if nxt - ch[-1][1] <= 0.5:
+                end = nxt          # lagatar bolna: cue seedha agle tak chale (flicker nahi)
+            else:
+                end = min(end, nxt - 0.02)
         end = max(end, start + 0.5)
         s = (start - offset) / speed
         e = (end - offset) / speed
@@ -205,12 +218,53 @@ def _merge_windows(cues, gap=0.35):
     return wins
 
 
+# ---------------- OVERLAY IMAGE (vertical videos) ----------------
+OVERLAY_TOP_OPACITY = float(os.environ.get("OVERLAY_TOP_OPACITY", "0.01"))
+OVERLAY_BOTTOM_OPACITY = float(os.environ.get("OVERLAY_BOTTOM_OPACITY", "0.03"))
+
+
+def fetch_overlay_image(url, dest_path, tries=3):
+    """Overlay image download karta hai aur ffprobe se validate karta hai.
+    Fail ho to None (overlay skip hoga, pipeline nahi rukegi)."""
+    if not url:
+        return None
+    import time
+    import requests
+    last = ""
+    for attempt in range(1, tries + 1):
+        try:
+            r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            if len(r.content) < 500:
+                raise RuntimeError(f"image bahut chhoti ({len(r.content)} bytes)")
+            with open(dest_path, "wb") as f:
+                f.write(r.content)
+            w, h = probe_dimensions(dest_path)  # decodable image hai ya nahi
+            if w < 16 or h < 16:
+                raise RuntimeError(f"image dimensions galat: {w}x{h}")
+            return dest_path
+        except Exception as e:
+            last = str(e)[:200]
+            time.sleep(2 * attempt)
+    print(f"Overlay image fetch fail ({last}) — overlay skip hoga.", flush=True)
+    try:
+        os.remove(dest_path)
+    except OSError:
+        pass
+    return None
+
+
 # ---------------- MAIN PART BUILDER ----------------
 def make_part(input_src, offset_sec, dur_sec, part_no, total_parts, out_path,
-              width=None, height=None, words=None):
+              width=None, height=None, words=None, overlay_img=None, use_zoom=True):
     """input_src se ek segment kaatta hai: mirror + smooth zoom + color-grade +
-    random fingerprint + (optional) professional captions + 'Part N/Total'
-    label. Native aspect ratio preserve hoti hai."""
+    random fingerprint + (vertical video par) overlay image + (optional)
+    professional captions + 'Part N/Total' label. Native aspect ratio
+    preserve hoti hai.
+
+    Vertical video me frame ko do barabar halves maana jata hai (kata nahi
+    jata): upar wale aadhe par overlay image OVERLAY_TOP_OPACITY (1%) par, aur
+    niche wale aadhe par OVERLAY_BOTTOM_OPACITY (3%) par poori cover karti hai."""
     if not width or not height:
         width, height = probe_dimensions(input_src)
     fps_str, fps_val = probe_fps(input_src)
@@ -218,16 +272,18 @@ def make_part(input_src, offset_sec, dur_sec, part_no, total_parts, out_path,
     p = random_fingerprint_params()
 
     cw, ch = _even(width - 2 * p["crop_x"]), _even(height - 2 * p["crop_y"])
+    is_vertical = ch > cw
 
-    # Zoom: smooth sine. `in` = input frame number; fps_val source fps ke
-    # barabar hai (zoompan ka default 25 tha — wahi sync bigadta tha).
     zoom_expr = (f"{ZOOM_BASE}+{ZOOM_AMP}*sin(2*PI*in/({fps_val:.4f}*{ZOOM_PERIOD_SEC}))")
-
-    vf = (
-        "hflip,"
-        f"crop={cw}:{ch}:{p['crop_x']}:{p['crop_y']},"
+    zoom_stage = (
         f"zoompan=z='{zoom_expr}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
         f"s={cw}x{ch}:fps={fps_str},"
+    ) if use_zoom else ""
+
+    pre = (
+        "hflip,"
+        f"crop={cw}:{ch}:{p['crop_x']}:{p['crop_y']},"
+        f"{zoom_stage}"
         f"eq=brightness={p['brightness']}:saturation={p['saturation']}:"
         f"contrast={p['contrast']}:gamma=0.95,"
         "vibrance=intensity=0.15,"
@@ -235,13 +291,32 @@ def make_part(input_src, offset_sec, dur_sec, part_no, total_parts, out_path,
         "curves=master='0/0.03 0.5/0.5 1/0.97',"
         f"noise=alls={p['noise']}:allf=t+u,"
         # setpts se video compress hota hai; fps=30:round=near se frames
-        # exactly sahi jagah par aate hai (sirf -r 30 par chhodne se video
-        # 2 frame tak late reh jata tha).
+        # exactly sahi jagah par aate hai (A/V sync).
         f"setpts=PTS/{p['speed']},fps=30:round=near"
     )
 
+    stages = [f"[0:v]{pre}[m0]"]
+    cur = "m0"
+    notes = []
+
+    # ---- Overlay image (sirf vertical): upar 1%, niche 3% ----
+    use_overlay = bool(overlay_img) and is_vertical
+    if use_overlay:
+        ht = _even(ch // 2)
+        hb = ch - ht
+        stages += [
+            "[1:v]format=rgba,split[i1][i2]",
+            f"[i1]scale={cw}:{ht}:force_original_aspect_ratio=increase,crop={cw}:{ht},"
+            f"colorchannelmixer=aa={OVERLAY_TOP_OPACITY}[ot]",
+            f"[i2]scale={cw}:{hb}:force_original_aspect_ratio=increase,crop={cw}:{hb},"
+            f"colorchannelmixer=aa={OVERLAY_BOTTOM_OPACITY}[ob]",
+            f"[{cur}][ot]overlay=0:0:format=auto:shortest=1[m1]",
+            f"[m1][ob]overlay=0:{ht}:format=auto:shortest=1[m2]",
+        ]
+        cur = "m2"
+        notes.append("overlay")
+
     # ---- Captions (blurred frosted band + white text w/ thin black outline) ----
-    caption_note = "no captions"
     ass_path = None
     fs = max(24, int(min(cw, ch) * 0.055))
     sw = _even(int(cw * 0.90))
@@ -256,22 +331,26 @@ def make_part(input_src, offset_sec, dur_sec, part_no, total_parts, out_path,
             write_ass(ass_path, cues, cw, ch, fs, cw // 2, sy + sh // 2, sx + 30)
             wins = _merge_windows(cues)
             enable = "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in wins)
-            vf += (
-                f",split[a][b];[b]crop={sw}:{sh}:{sx}:{sy},gblur=sigma=24,"
-                "eq=brightness=-0.10:saturation=0.9[bl];"
+            stages += [
+                f"[{cur}]split[a][b]",
+                f"[b]crop={sw}:{sh}:{sx}:{sy},gblur=sigma=24,eq=brightness=-0.10:saturation=0.9[bl]",
                 f"[a][bl]overlay={sx}:{sy}:enable='{enable}',"
-                f"ass=filename='{ass_path}':fontsdir={FONTS_DIR}"
-            )
-            caption_note = f"{len(cues)} caption cues"
+                f"ass=filename='{ass_path}':fontsdir={FONTS_DIR}[m3]",
+            ]
+            cur = "m3"
+            notes.append(f"{len(cues)} captions")
 
     # ---- Part label: yellow text, white box, thin black outline ----
-    vf += (
-        f",drawtext=fontfile={FONT}:text='{label}':x=(w-text_w)/2:y=h-120:"
+    stages.append(
+        f"[{cur}]drawtext=fontfile={FONT}:text='{label}':x=(w-text_w)/2:y=h-120:"
         "fontsize=44:fontcolor=yellow:borderw=2:bordercolor=black:"
-        "box=1:boxcolor=white@1.0:boxborderw=20"
+        "box=1:boxcolor=white@1.0:boxborderw=20[vout]"
     )
 
     # ---- Audio: pehle 48kHz (SYNC FIX), phir pitch+speed+volume ----
+    # IMPORTANT: audio ko -filter_complex ke andar NAHI rakhte. zoompan ke
+    # saath audio filters (aresample/atempo) ek hi complex graph me hone par
+    # ffmpeg ki memory ~4GB tak phat jati thi (OOM-kill). Alag -af me safe hai.
     atempo = round(p["speed"] / p["pitch"], 4)
     af = (
         "aresample=48000,"
@@ -280,10 +359,23 @@ def make_part(input_src, offset_sec, dur_sec, part_no, total_parts, out_path,
         "aresample=async=1:first_pts=0"
     )
 
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-ss", str(offset_sec), "-i", input_src, "-t", str(dur_sec),
-        "-vf", vf, "-af", af,
+    audio_present = has_audio(input_src)
+    cmd = ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-ss", str(offset_sec), "-i", input_src]
+    next_idx = 1
+    if use_overlay:
+        cmd += ["-loop", "1", "-framerate", "30", "-i", overlay_img]
+        next_idx += 1
+    if not audio_present:
+        # Source me audio nahi hai — silent track laga do (part fail na ho)
+        cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+        audio_map = ["-map", f"{next_idx}:a"]
+        notes.append("silent audio")
+    else:
+        audio_map = ["-map", "0:a", "-af", af]
+    cmd += [
+        "-t", str(dur_sec),
+        "-filter_complex", ";".join(stages),
+        "-map", "[vout]", *audio_map,
         "-r", "30", "-g", "60", "-sc_threshold", "0", "-bf", "2",
         "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main", "-level:v", "4.1",
         "-crf", "23", "-maxrate", "6M", "-bufsize", "12M",
@@ -298,8 +390,10 @@ def make_part(input_src, offset_sec, dur_sec, part_no, total_parts, out_path,
         except OSError:
             pass
     if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg part cut failed (part {part_no}): {(r.stderr or '')[-500:]}")
-    return out_path, (cw, ch), caption_note
+        # returncode negative ho to ffmpeg ko signal se maara gaya (jaise OOM kill)
+        raise RuntimeError(f"ffmpeg part cut failed (part {part_no}, rc={r.returncode}): "
+                           f"{(r.stderr or '')[-500:] or '<no stderr>'}")
+    return out_path, (cw, ch), (", ".join(notes) if notes else "plain")
 
 
 # ---------------- RECAP OUTRO (freeze-frame + Edge-TTS voice-over) ----------------
@@ -337,7 +431,7 @@ def add_recap_outro(part_path, title, description, out_path, width, height):
 
     last_frame = os.path.join(work_dir, f"{base}_lastframe.png")
     r = subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-1", "-i", part_path,
+        ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-sseof", "-1", "-i", part_path,
          "-update", "1", "-q:v", "2", last_frame],
         capture_output=True, text=True,
     )
@@ -352,7 +446,7 @@ def add_recap_outro(part_path, title, description, out_path, width, height):
         "box=1:boxcolor=white@1.0:boxborderw=34"
     )
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        "ffmpeg", "-nostdin", "-y", "-loglevel", "error",
         "-loop", "1", "-i", last_frame, "-i", tts_path,
         "-t", str(freeze_dur), "-vf", vf,
         "-r", "30", "-g", "60", "-sc_threshold", "0",
@@ -370,7 +464,7 @@ def add_recap_outro(part_path, title, description, out_path, width, height):
         f.write(f"file '{os.path.abspath(part_path)}'\n")
         f.write(f"file '{os.path.abspath(freeze_clip)}'\n")
     r = subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+        ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
          "-i", list_file, "-c", "copy", out_path],
         capture_output=True, text=True,
     )
