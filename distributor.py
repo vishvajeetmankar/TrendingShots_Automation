@@ -98,7 +98,11 @@ def wipe_work():
 
 # ---------------- SHEET ----------------
 def open_sheet():
-    gc = gspread.service_account_from_dict(json.loads(os.environ["GCP_SA_JSON"]))
+    info = json.loads(os.environ["GCP_SA_JSON"])
+    try:  # Sheets API ke 429 (rate-limit) par khud backoff+retry
+        gc = gspread.service_account_from_dict(info, http_client=gspread.BackOffHTTPClient)
+    except (TypeError, AttributeError):
+        gc = gspread.service_account_from_dict(info)
     sh = gc.open_by_key(SHEET_ID)
     parts_q = sh.worksheet("PartsQueue")
     try:
@@ -208,18 +212,54 @@ def fetch_parts_artifact(series_id):
 
 
 # ---------------- YOUTUBE UPLOAD (PUBLIC) ----------------
+class QuotaExceeded(Exception):
+    """YouTube daily quota/upload-limit khatam — part ka koi kasoor nahi, isliye
+    retry-counter nahi badhta; run rok ke agle run me phir try hota hai."""
+
+
+class YTAuthError(Exception):
+    """YouTube token expire/revoke — isse bhi parts skip nahi hone chahiye."""
+
+
 def yt_service():
     info = json.loads(os.environ["YT_TOKEN_JSON"])
     creds = Credentials.from_authorized_user_info(info, SCOPES)
     if not creds.valid:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except Exception as e:
+            raise YTAuthError(f"YouTube token refresh fail (get_token.py dobara chalao): {e}")
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
+
+
+def fit_tags(tags, limit=450):
+    """YouTube: saare tags ke characters ka total ~500 se zyada ho to poora
+    upload reject ho jata hai (invalidTags). Isliye limit ke andar rakho."""
+    out, total = [], 0
+    for t in tags or []:
+        t = str(t).replace("<", "").replace(">", "").strip()
+        if not t:
+            continue
+        cost = len(t) + (2 if " " in t else 0) + 1
+        if total + cost > limit:
+            break
+        out.append(t)
+        total += cost
+    return out
+
+
+def fit_description(desc, max_bytes=4800):
+    desc = str(desc or "").replace("<", "").replace(">", "")
+    while len(desc.encode("utf-8")) > max_bytes:
+        desc = desc[:-100]
+    return desc
 
 
 def upload_youtube(video_path, title, description, tags):
     yt = yt_service()
     body = {
-        "snippet": {"title": title[:100], "description": description, "tags": tags, "categoryId": "24"},
+        "snippet": {"title": title[:100], "description": fit_description(description),
+                    "tags": fit_tags(tags), "categoryId": "24"},
         "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
     }
     media = MediaFileUpload(video_path, chunksize=8 * 1024 * 1024, resumable=True, mimetype="video/mp4")
@@ -231,7 +271,7 @@ def upload_youtube(video_path, title, description, tags):
         except HttpError as e:
             content = (e.content or b"").decode("utf-8", "ignore")
             if "quotaExceeded" in content or "uploadLimitExceeded" in content:
-                raise RuntimeError(f"YouTube quota/upload limit khatam: {content[:200]}")
+                raise QuotaExceeded(f"YouTube quota/upload limit khatam: {content[:200]}")
             if e.resp.status in (500, 502, 503, 504) and retries < 5:
                 retries += 1
                 time.sleep(5 * retries)
@@ -298,11 +338,24 @@ def fb_upload_part(path, title, description):
 # ---------------- ORCHESTRATION ----------------
 def build_caption(d, part_no, total_parts):
     hashtags = clean_hashtags(json.loads(d.get("hashtags_json") or "[]"))
-    title = f"{d.get('title')} — Part {part_no}/{total_parts}"
+    suffix = f" — Part {part_no}/{total_parts}"
+    # YouTube title max 100 chars: base title ko chhota karo, suffix nahi
+    # (warna lambe title me "Part X/Y" hi kat jata tha).
+    base = str(d.get("title") or "").replace("<", "").replace(">", "")
+    base = base[: max(10, 100 - len(suffix))].rstrip()
+    title = f"{base}{suffix}"
     desc = f"{d.get('description') or ''}\n\nPart {part_no}/{total_parts}"
     if hashtags:
         desc += "\n\n" + hashtag_block(hashtags)
     return title, desc
+
+
+def skip_part(parts_q, row_num, next_index, total_parts):
+    new_index = next_index + 1
+    parts_q.update_cell(row_num, COLS.index("next_index") + 1, new_index)
+    parts_q.update_cell(row_num, COLS.index("hint") + 1, "")
+    if new_index > total_parts:
+        parts_q.update_cell(row_num, COLS.index("status") + 1, "done")
 
 
 def main():
@@ -369,12 +422,27 @@ def main():
         parts = fetch_parts_artifact(active_series_id)
         clip = parts.get(next_index)
         if not clip:
-            log(f"Part {next_index} ka ready file artifact me nahi mila — agla run try karega.")
-            tg(f"⚠️ Part {next_index}/{total_parts} ({d['title']}) ka ready file abhi nahi mila.")
+            if parts:
+                # Artifact mil gaya par ye part usme hai hi nahi (ingestion me ye
+                # part ban nahi paya tha) — kabhi nahi aayega, to skip karo.
+                log(f"Part {next_index} artifact me hai hi nahi (ingestion me nahi bana) — skip.")
+                tg(f"⏭️ Part {next_index}/{total_parts} ({d['title']}) ingestion me ban nahi paya tha — skip kiya.")
+                skip_part(parts_q, row_num, next_index, total_parts)
+                continue
+            # Artifact hi nahi mila: abhi bana nahi / network issue / expire.
+            retries = int(hint_val) + 1 if hint_val.isdigit() else 1
+            if retries >= MAX_RUN_LEVEL_RETRIES:
+                log("Artifact baar-baar nahi mila — is series ko 'done' mark kar raha hoon.")
+                tg(f"🛑 Series '{d['title']}' ka artifact {retries} baar nahi mila (expire hua hoga). "
+                   f"Bache hue parts chhod ke agli series pe ja raha hoon.")
+                parts_q.update_cell(row_num, COLS.index("status") + 1, "done")
+                parts_q.update_cell(row_num, COLS.index("hint") + 1, "")
+            else:
+                parts_q.update_cell(row_num, COLS.index("hint") + 1, str(retries))
+                tg(f"⚠️ Series '{d['title']}' ka artifact nahi mila ({retries}/{MAX_RUN_LEVEL_RETRIES}) "
+                   f"— agla run phir try karega.")
             failed += 1
-            if failed >= 2:
-                break
-            continue
+            break
 
         title, desc = build_caption(d, next_index, total_parts)
         tags = json.loads(d.get("tags_json") or "[]")
@@ -387,6 +455,13 @@ def main():
             yt_id, yt_link = upload_youtube(clip, title, desc, tags)
             hist.append_row([now_ist(), active_series_id, "SUCCESS", yt_link, title, "", "YT_PART"])
             yt_ok = True
+        except (QuotaExceeded, YTAuthError) as e:
+            # Part ka kasoor nahi — retry-counter nahi badhta, FB par bhi nahi
+            # bhejte (taaki YT/FB ke parts alag-alag na ho jaye). Run rok do.
+            log(f"YouTube blocker: {e}")
+            tg(f"🛑 Distributor ruk gaya (part {next_index}/{total_parts} safe hai, skip nahi hua):\n{str(e)[:300]}")
+            wipe_work()
+            return 0
         except Exception as e:
             hist.append_row([now_ist(), active_series_id, "FAILED", "", title, str(e)[:300], "YT_PART"])
             errs.append(f"YT: {str(e)[:200]}")
