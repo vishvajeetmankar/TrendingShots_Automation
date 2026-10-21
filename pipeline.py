@@ -36,7 +36,8 @@ import gspread
 from groq import Groq
 
 from seo_utils import clean_hashtags, clean_tags
-from video_utils import make_part, probe_dimensions, probe_fps, add_recap_outro
+from video_utils import (make_part, probe_dimensions, probe_fps, add_recap_outro,
+                         fetch_overlay_image)
 
 # ---------------- CONFIG ----------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -53,6 +54,12 @@ TRANSCRIBE_MAX_SECONDS = 600
 PART_SECONDS = 600            # 10-minute parts
 BUFFER_THRESHOLD = 5          # itne parts pending rahte hai to naya ingestion skip
 MAX_ATTEMPTS = 3
+MIN_FREE_DISK_GB = 1.5        # isse kam free disk par naye parts banana rok dete hai
+# Vertical videos par 1%/3% opacity wali overlay image (video_utils me opacity set hai)
+OVERLAY_IMAGE_URL = os.environ.get(
+    "OVERLAY_IMAGE_URL",
+    "https://i.ibb.co/bRdS6hqQ/Chat-GPT-Image-Aug-23-2026-10-15-32-AM.png",
+)
 
 WORK = "work"
 ARTIFACT_DIR = "artifact_out"   # WORK ke bahar — wipe_work() isse nahi chhuta
@@ -88,7 +95,11 @@ def tg(msg):
 
 # ---------------- SHEET ----------------
 def open_sheet():
-    gc = gspread.service_account_from_dict(json.loads(os.environ["GCP_SA_JSON"]))
+    info = json.loads(os.environ["GCP_SA_JSON"])
+    try:  # Sheets API ke 429 (rate-limit) par khud backoff+retry
+        gc = gspread.service_account_from_dict(info, http_client=gspread.BackOffHTTPClient)
+    except (TypeError, AttributeError):
+        gc = gspread.service_account_from_dict(info)
     sh = gc.open_by_key(SHEET_ID)
     queue = sh.worksheet("Queue")  # ye user khud maintain karta hai
     try:
@@ -177,7 +188,7 @@ def edit(raw):
     atempo = f"atempo={SPEED_FACTOR}" if SPEED_FACTOR <= 2.0 else f"atempo=2.0,atempo={SPEED_FACTOR / 2.0}"
     af = f"aresample=48000,{atempo},aresample=async=1:first_pts=0"
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error", "-i", raw, "-vf", vf, "-af", af,
+        "ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", raw, "-vf", vf, "-af", af,
         "-map_metadata", "-1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000", "-b:a", "160k",
         "-movflags", "+faststart", out,
@@ -252,7 +263,7 @@ def transcribe_full(edited_path, duration):
     for k in range(n_chunks):
         off = k * chunk_len
         audio = os.path.join(WORK, f"chunk_{k:03d}.mp3")
-        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(off), "-t", str(chunk_len),
+        cmd = ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-ss", str(off), "-t", str(chunk_len),
                "-i", edited_path, "-vn", "-ac", "1", "-ar", "16000",
                "-c:a", "libmp3lame", "-b:a", "48k", audio]
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -414,12 +425,28 @@ def fallback_metadata():
 
 
 # ---------------- 5. CUT INTO 10-MIN PARTS ----------------
-def prepare_parts(edited_path, duration, series_id, title="", description="", words=None):
+def disk_free_gb(path="."):
+    try:
+        return shutil.disk_usage(path).free / (1024 ** 3)
+    except OSError:
+        return 999.0
+
+
+def prepare_parts(edited_path, duration, series_id, title="", description="",
+                  words=None, overlay_img=None):
     """Poore video ko 10-min parts me kaatta hai. Aakhri bacha hua tukda
     (remainder) alag chhota part nahi banta — last part me hi jud jata hai.
-    Har part me random fingerprint-variation lagta hai, aur end me ~1 min ka
-    freeze-frame + voice recap outro jodta hai (outro fail ho to part bina
-    outro ke hi ship hota hai, poora pipeline nahi rukta)."""
+
+    Har part ke liye FALLBACK CHAIN (koi fancy feature fail ho to part gayab
+    nahi hota, simple version me ban jata hai):
+        1) captions + overlay image + zoom   (full)
+        2) bina captions
+        3) bina captions, bina overlay image
+        4) bina captions, bina overlay, bina zoom  (sabse safe)
+    Aakhir me end me ~1 min ka freeze-frame + voice recap outro jodta hai
+    (outro fail ho to part bina outro ke hi ship hota hai).
+
+    Returns: (total_parts, parts_made, notes)"""
     total_parts = max(1, int(duration // PART_SECONDS))
     parts_dir = os.path.join(ARTIFACT_DIR, "parts")
     os.makedirs(parts_dir, exist_ok=True)
@@ -429,32 +456,70 @@ def prepare_parts(edited_path, duration, series_id, title="", description="", wo
     width, height = probe_dimensions(edited_path)
     log(f"Source dimensions: {width}x{height} | {total_parts} parts banenge (~{PART_SECONDS // 60} min each)")
 
-    parts_made = 0
+    levels = [
+        ("full", dict(words=words, overlay_img=overlay_img, use_zoom=True)),
+        ("no-captions", dict(words=None, overlay_img=overlay_img, use_zoom=True)),
+        ("no-captions/no-overlay", dict(words=None, overlay_img=None, use_zoom=True)),
+        ("safe-mode(no zoom)", dict(words=None, overlay_img=None, use_zoom=False)),
+    ]
+    # Jo features pehle se hi off hai unke duplicate levels hata do
+    seen, uniq = set(), []
+    for name, kw in levels:
+        key = (bool(kw["words"]), bool(kw["overlay_img"]), kw["use_zoom"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append((name, kw))
+    levels = uniq
+
+    parts_made, notes, degraded, no_outro, failed_parts = 0, [], [], [], []
     for i in range(1, total_parts + 1):
+        if disk_free_gb() < MIN_FREE_DISK_GB:
+            log(f"Disk kam hai ({disk_free_gb():.1f}GB free) — baaki parts nahi bana raha.")
+            notes.append(f"disk full hone se part {i} se aage nahi bane")
+            failed_parts.extend(range(i, total_parts + 1))
+            break
         offset = (i - 1) * PART_SECONDS
-        # Aakhri part poora bacha hua duration le leta hai (remainder absorb).
         this_dur = (duration - offset) if i == total_parts else PART_SECONDS
         final_path = os.path.join(parts_dir, f"part_{i:03d}.mp4")
         raw_part = os.path.join(tmp_dir, f"part_{i:03d}_main.mp4")
-        try:
-            _, (cw, ch), cap_note = make_part(edited_path, offset, this_dur, i, total_parts,
-                                              raw_part, width, height, words=words)
+
+        built, cw, ch, cap_note, used_level = False, width, height, "", ""
+        for lvl_name, kw in levels:
             try:
-                add_recap_outro(raw_part, title, description, final_path, cw, ch)
-                log(f"Part {i}/{total_parts} taiyar ({cap_note}, recap outro ke saath, {this_dur:.0f}s main)")
+                _, (cw, ch), cap_note = make_part(edited_path, offset, this_dur, i, total_parts,
+                                                  raw_part, width, height, **kw)
+                built, used_level = True, lvl_name
+                break
             except Exception as e:
-                log(f"Part {i} recap outro fail ({e}) — bina outro ke ship kar raha hoon.")
-                shutil.copy(raw_part, final_path)
-            parts_made += 1
+                log(f"Part {i} level '{lvl_name}' fail: {str(e)[:300]}")
+        if not built:
+            log(f"Part {i} kisi bhi level me nahi bana — skip.")
+            failed_parts.append(i)
+            continue
+        if used_level != "full":
+            degraded.append(f"{i}({used_level})")
+
+        try:
+            add_recap_outro(raw_part, title, description, final_path, cw, ch)
+            log(f"Part {i}/{total_parts} taiyar [{used_level}: {cap_note}] + recap outro")
         except Exception as e:
-            log(f"Part {i} banane me fail hua (skip): {e}")
-        finally:
-            try:
-                os.remove(raw_part)
-            except OSError:
-                pass
+            log(f"Part {i} recap outro fail ({str(e)[:200]}) — bina outro ke ship.")
+            no_outro.append(i)
+            shutil.copy(raw_part, final_path)
+        parts_made += 1
+        try:
+            os.remove(raw_part)
+        except OSError:
+            pass
+
+    if degraded:
+        notes.append("simple mode me bane: " + ", ".join(degraded))
+    if no_outro:
+        notes.append(f"recap outro nahi laga: parts {no_outro}")
+    if failed_parts:
+        notes.append(f"BANE NAHI: parts {failed_parts}")
     log(f"{parts_made}/{total_parts} parts taiyar ho gaye.")
-    return total_parts
+    return total_parts, parts_made, notes
 
 
 # ---------------- ORCHESTRATION ----------------
@@ -470,7 +535,14 @@ def wipe_work():
 def process(url, parts_q):
     raw = download(url)
     edited = edit(raw)
+    try:  # raw ab zaroorat nahi — disk bachao (lambe videos me kai GB)
+        os.remove(raw)
+    except OSError:
+        pass
     duration = probe_duration(edited)
+    if duration < 5:
+        raise RuntimeError(f"Edited video ki duration bahut kam hai ({duration:.1f}s) — source kharab lagta hai.")
+    notes = []
 
     # Poore video ka word-level transcript — captions ke liye bhi, aur
     # pehle 10 min ka text metadata ke liye bhi (alag se dobara transcribe nahi).
@@ -480,6 +552,8 @@ def process(url, parts_q):
     except Exception as e:
         log(f"Full transcription fail (captions nahi honge): {e}")
 
+    if not words:
+        notes.append("transcript nahi mila — captions nahi lage")
     meta = None
     try:
         transcript = text_of_first_seconds(words, TRANSCRIBE_MAX_SECONDS)
@@ -496,20 +570,27 @@ def process(url, parts_q):
     tags = clean_tags(meta.get("tags"))
 
     series_id = uuid.uuid4().hex[:12]
-    total_parts = 0
-    try:
-        total_parts = prepare_parts(edited, duration, series_id, title, description, words)
-        parts_q.append_row([
-            now_ist(), series_id, title, description,
-            json.dumps(hashtags, ensure_ascii=False), json.dumps(tags, ensure_ascii=False),
-            round(duration, 1), PART_SECONDS, total_parts, 1, "pending", "",
-        ])
-    except Exception as e:
-        log(f"Parts prep/queue fail hua: {e}")
-        raise
+
+    overlay_img = fetch_overlay_image(OVERLAY_IMAGE_URL, os.path.join(WORK, "overlay.png"))
+    if OVERLAY_IMAGE_URL and not overlay_img:
+        notes.append("overlay image download nahi hui — overlay skip hua")
+
+    total_parts, parts_made, part_notes = prepare_parts(
+        edited, duration, series_id, title, description, words, overlay_img)
+    notes.extend(part_notes)
+    if parts_made == 0:
+        # Ek bhi part nahi bana — queue me khaali series mat daalo; link fail
+        # mana jayega aur agla link try hoga.
+        raise RuntimeError("Koi bhi part nahi ban paya (details upar log me).")
+
+    parts_q.append_row([
+        now_ist(), series_id, title, description,
+        json.dumps(hashtags, ensure_ascii=False), json.dumps(tags, ensure_ascii=False),
+        round(duration, 1), PART_SECONDS, total_parts, 1, "pending", "",
+    ])
 
     thumb = meta.get("thumbnail_prompt", "")
-    return series_id, title, thumb, total_parts
+    return series_id, title, thumb, total_parts, notes
 
 
 def main():
@@ -535,7 +616,7 @@ def main():
             return 0
         tg(f"⏳ Ingestion start (try {attempt}/{MAX_ATTEMPTS}, buffer={buffer}):\n{url}")
         try:
-            series_id, title, thumb, total_parts = process(url, parts_q)
+            series_id, title, thumb, total_parts, notes = process(url, parts_q)
             hist.append_row([now_ist(), url, "SUCCESS", series_id, title, "", "INGEST"])
             queue.delete_rows(row)
 
@@ -546,6 +627,8 @@ def main():
 
             msg = (f"✅ SUCCESS — prepped {total_parts} parts (~10 min each)\n{title}\n"
                    f"Series ID: {series_id}\nQueue me bache: {remaining}")
+            if notes:
+                msg += "\n\n⚠️ Notes:\n• " + "\n• ".join(notes)
             if thumb:
                 msg += f"\n\n🎨 Thumbnail prompt:\n{thumb}"
             tg(msg)
